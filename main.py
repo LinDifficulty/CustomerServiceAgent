@@ -1,4 +1,4 @@
-from ecommerce_agent_cli import main
+from rag_server.cli import main
 
 
 if __name__ == "__main__":

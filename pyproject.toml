@@ -11,10 +11,13 @@ dependencies = [
     "jieba>=0.42.1",
     "langchain>=1.2.15",
     "langchain-community>=0.4.1",
+    "langchain-mcp-adapters>=0.2.2",
     "langchain-text-splitters>=0.3.11",
     "langgraph>=1.1.9",
+    "mcp>=1.27.0",
     "pypdf>=6.10.2",
     "rank-bm25>=0.2.2",
     "requests>=2.33.1",
     "sentence-transformers>=5.4.1",
+    "setuptools<81",
 ]

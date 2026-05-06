@@ -1,333 +1,426 @@
 # RAG Server
 
-这是一个本地可复用的 RAG 组件项目，当前包含两部分能力：
+本地可复用的 RAG 组件库，面向中文知识库场景。当前包含：
 
-- 一个面向中文知识库的 `RAGService`
-- 一个基于 LangGraph 的电商客服 CLI Agent
+- **RAGService**：向量 + BM25 混合召回 + CrossEncoder 精排的检索服务
+- **CLI Agent**：基于 LangGraph 的电商客服命令行 Agent
+- **QueryRewriter**：同模型 query 改写与多 query 融合检索
+- **MemoryService**：按用户隔离的长期记忆（profile / episode / procedure 三层）
+- **SkillRegistry**：Anthropic-style Skills 发现与按需加载
+- **MCP Client**：加载外部 MCP Server 工具并注入 Agent
+- **TraceRecorder**：JSONL 格式的全链路 trace
+- **Retrieval Eval**：检索评测框架，输出 hit rate、MRR 等指标
 
-它现在还不是 HTTP API 服务。更准确地说，这个仓库已经把“知识入库、检索、精排、Agent 调用”这层能力搭好了，后续如果要接 `FastAPI`、`Flask` 或其他服务层，可以直接在现有代码上继续封装。
+这不是 HTTP API 服务。核心能力已经封装为 Python 包，后续可直接用 FastAPI / Flask 等框架包装。
 
-## 当前能力
+## 快速开始
 
-- 支持 `txt`、`md`、`pdf` 文档入库
-- 使用 `DashScopeEmbeddings` 做向量化
-- 使用 `FAISS` 做向量检索
-- 使用 `jieba + BM25Plus` 做关键词检索
-- 支持向量检索与 BM25 混合召回
-- 支持 `CrossEncoder` 精排
-- 索引和切片元数据持久化到本地磁盘
-- 提供一个可直接运行的电商客服命令行 Agent
-
-## 项目结构
-
-```text
-.
-├── rag_service.py          # RAG 核心实现
-├── ecommerce_agent_cli.py  # 电商客服 CLI Agent
-├── main.py                 # CLI 启动入口
-├── docs/                   # 示例知识库文档
-├── data/
-│   ├── faiss.index         # 向量索引
-│   └── metadata.json       # 切片内容与元数据
-├── pyproject.toml          # 项目依赖
-└── README.md
-```
-
-## 技术栈
+### 环境要求
 
 - Python 3.12+
-- LangChain
-- LangGraph
-- DashScope
-- FAISS
-- rank-bm25
-- sentence-transformers
+- [uv](https://docs.astral.sh/uv/) 包管理器
 
-## 安装依赖
-
-项目使用 `uv` 管理依赖：
+### 安装
 
 ```bash
 uv sync
 ```
 
-## 环境变量
-
-运行前至少需要配置 DashScope Key：
+### 环境变量
 
 ```bash
 export DASHSCOPE_API_KEY="你的 DashScope Key"
 ```
 
-说明：
+所有向量化（DashScope `text-embedding-v4`）和 LLM 调用（`ChatTongyi`，模型 `qwen3-max-2026-01-23`）都依赖此 Key。
 
-- `RAGService` 在做向量化时会调用 DashScope embedding
-- CLI Agent 使用 `ChatTongyi(model="qwen3-max-2026-01-23")`
-- 如果首次执行精排，`CrossEncoder` 模型会下载到本地，首轮会比后续更慢
+### 入库示例文档
 
-## 快速开始
+```bash
+uv run python examples/ingest_documents.py
+```
 
-### 1. 作为 RAG 组件直接调用
+会把 `docs/` 下的三份示例文档写入 `data/` 索引。
+
+### 启动 CLI Agent
+
+```bash
+uv run python main.py
+```
+
+退出：输入 `quit` 或 `exit`。
+
+## 作为 RAG 组件调用
 
 ```python
-from rag_service import RAGService
+from rag_server import RAGService
 
 rag = RAGService(data_dir="data")
 
-rag.add_documents(
-    [
-        "./docs/尺码推荐.txt",
-        "./docs/颜色选择.txt",
-        "./docs/洗涤养护.txt",
-    ]
-)
+# 入库
+rag.add_documents([
+    "./docs/尺码推荐.txt",
+    "./docs/颜色选择.txt",
+    "./docs/洗涤养护.txt",
+])
 
+# 检索（默认：向量 + BM25 混合召回 → CrossEncoder 精排）
 results = rag.search("160cm、95斤适合穿什么尺码？", top_k=3)
 
 for item in results:
     print(item["score"], item["source"])
     print(item["content"])
-    print("-" * 40)
 ```
 
-### 2. 启动电商客服 CLI
+## CLI Agent 选项
 
 ```bash
-uv run python main.py
+uv run python main.py [OPTIONS]
 ```
 
-退出方式：
-
-- 输入 `quit`
-- 输入 `exit`
-
-## 现有示例知识库
-
-仓库里的 `docs/` 目前放的是一组服饰电商知识文档，包含：
-
-- 尺码推荐
-- 颜色选择建议
-- 洗涤与养护建议
-
-CLI Agent 不会直接把 `docs/` 目录当作硬编码答案读取，而是通过 `RAGService.search()` 检索相关片段后再组织回复。
-
-## RAG 检索流程
-
-默认 `search()` 的执行流程如下：
-
-1. 向量召回
-2. BM25 关键词召回
-3. 两路结果按权重融合
-4. 取前 `candidate_top_k` 个候选
-5. 使用 `CrossEncoder` 精排
-6. 返回最终 `top_k` 结果
-
-如果不希望精排，可以传入：
-
-```python
-rag.search("查询文案", use_rerank=False)
-```
-
-## 核心类说明
-
-### `RAGService`
-
-初始化签名：
-
-```python
-RAGService(
-    data_dir: str = "data",
-    model_name: str = "text-embedding-v4",
-    embeddings: Any | None = None,
-    reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
-    reranker: Any | None = None,
-    reranker_device: str | None = None,
-    reranker_batch_size: int = 16,
-    default_use_rerank: bool = True,
-    default_candidate_top_k: int = 20,
-    chunk_size: int = 500,
-    chunk_overlap: int = 100,
-)
-```
-
-常用参数：
-
-- `data_dir`：索引和元数据保存目录
-- `model_name`：DashScope embedding 模型名
-- `chunk_size`：默认切片大小
-- `chunk_overlap`：默认切片重叠大小
-- `default_use_rerank`：默认是否启用精排
-- `default_candidate_top_k`：精排前保留多少候选
-
-进阶参数：
-
-- `embeddings`：注入自定义 embedding 对象，方便测试或替换模型
-- `reranker`：注入自定义精排器
-- `reranker_device`：指定精排设备，例如 `cpu` 或 `cuda`
-- `reranker_batch_size`：精排批大小
-
-## 常用接口
-
-### `add_documents(file_paths, chunk_size=None, chunk_overlap=None)`
-
-作用：
-
-- 读取文档
-- 切片
-- 生成向量
-- 写入 FAISS
-- 重建 BM25
-- 持久化索引和元数据
+| 选项 | 可选值 | 默认 | 说明 |
+|------|--------|------|------|
+| `--query-rewrite` | `on` `off` `rewrite_only` `multi_query` | `on` | query 改写模式。`on` 等价于 `multi_query` |
+| `--bm25` | `on` `off` | `on` | BM25 关键词召回 |
+| `--cross-encoder` | `on` `off` | `off` | CrossEncoder 精排（首次使用会下载模型） |
+| `--memory` | `on` `off` | `on` | 长期记忆 |
+| `--memory-model` | 模型名 | `qwen3-max-2026-01-23` | 记忆抽取模型 |
+| `--skills` | `on` `off` | `on` | Anthropic-style Skills |
+| `--skills-dir` | 目录路径 | `.claude/skills` | 追加 Skills 目录，可多次传入 |
+| `--mcp` | `on` `off` | `off` | MCP Client 工具加载 |
+| `--mcp-config` | 文件路径 | `mcp_servers.json` | MCP Server 配置文件 |
+| `--trace` | `on` `off` | `off` | JSONL trace |
+| `--trace-dir` | 目录路径 | `traces` | trace 输出目录 |
+| `--user-id` | 字符串 | `default_user` | 用户记忆空间隔离 |
+| `--rewrite-model` | 模型名 | `qwen3-max-2026-01-23` | query 改写模型 |
 
 示例：
 
-```python
-rag.add_documents(
-    ["./docs/商品说明.txt", "./docs/售后政策.pdf"],
-    chunk_size=800,
-    chunk_overlap=150,
-)
+```bash
+# 关闭改写和 BM25，只做向量召回
+uv run python main.py --query-rewrite off --bm25 off
+
+# 开启精排和 trace
+uv run python main.py --cross-encoder on --trace on
+
+# 加载 MCP 工具
+uv run python main.py --mcp on --mcp-config ./mcp_servers.json
 ```
 
-返回格式：
+### CLI 内置命令
+
+**记忆管理：**
+
+| 命令 | 说明 |
+|------|------|
+| `/memory` | 查看当前用户的长期记忆 |
+| `/remember 内容` | 写入一条偏好记忆 |
+| `/remember-episode 内容` | 写入一条历史事件摘要 |
+| `/remember-procedure 内容` | 写入一条可复用流程 |
+| `/forget 记忆ID前缀` | 删除一条记忆 |
+| `/clear-memory` | 清空当前用户全部记忆 |
+
+**Skill 调用：**
+
+| 命令 | 说明 |
+|------|------|
+| `/sizing-advice 问题` | 显式调用尺码建议 Skill |
+| `/care-guidance 问题` | 显式调用洗涤养护 Skill |
+
+## 检索流程
+
+`RAGService.search()` 的默认流程：
+
+```
+向量召回 ──┐
+           ├→ 加权融合（0.7 / 0.3）→ 取 candidate_top_k 候选 → CrossEncoder 精排 → top_k 结果
+BM25 召回 ─┘
+```
+
+可通过参数关闭部分环节：
+
+```python
+rag.search("查询", use_bm25=False)      # 只用向量召回
+rag.search("查询", use_rerank=False)     # 跳过精排
+```
+
+也可以单独调用各阶段：
+
+```python
+rag.search_by_vector("查询", top_k=5)
+rag.search_by_bm25("查询", top_k=5)
+rag.search_by_hybrid("查询", top_k=10, vector_weight=0.7, bm25_weight=0.3)
+rag.rerank("查询", candidates, top_k=3)
+```
+
+### 搜索结果格式
 
 ```python
 {
-    "added_chunks": 12,
-    "sources": ["./docs/商品说明.txt", "./docs/售后政策.pdf"]
-}
-```
-
-注意：
-
-- 仅支持 `txt`、`md`、`pdf`
-- `chunk_overlap` 必须小于 `chunk_size`
-
-### `search_by_vector(query, top_k=3)`
-
-只使用向量召回。
-
-### `search_by_bm25(query, top_k=3)`
-
-只使用 BM25 关键词检索。
-
-### `search_by_hybrid(query, top_k=10, vector_weight=0.7, bm25_weight=0.3)`
-
-混合召回，不做精排。
-
-### `rerank(query, candidates, top_k=None)`
-
-对候选结果执行精排。
-
-### `search(query, top_k=3, vector_weight=0.7, bm25_weight=0.3, use_rerank=None, candidate_top_k=None)`
-
-默认搜索入口，适合业务代码直接调用。
-
-### `reset()`
-
-清空当前知识库的 FAISS、BM25 和元数据。
-
-## 返回结果格式
-
-搜索结果为 `list[dict]`，单条数据结构类似：
-
-```python
-{
-    "score": 0.91,
-    "vector_score": 0.88,
-    "bm25_score": 1.0,
-    "hybrid_score": 0.916,
-    "rerank_score": 3.42,
+    "score": 0.91,            # 最终排序分数
+    "vector_score": 0.88,     # 向量检索分数
+    "bm25_score": 1.0,        # BM25 分数
+    "hybrid_score": 0.916,    # 融合分数
+    "rerank_score": 3.42,     # 精排分数（未精排时为 None）
     "content": "命中的文本片段",
     "source": "docs/尺码推荐.txt",
     "metadata": {"chunk_index": 0},
-    "retrieval_mode": "hybrid_rerank",
+    "retrieval_mode": "hybrid_rerank",  # vector / bm25 / hybrid / hybrid_rerank
 }
 ```
 
-字段说明：
+## 文档管理
 
-- `score`：当前排序最终分数
-- `vector_score`：向量检索分数
-- `bm25_score`：BM25 分数
-- `hybrid_score`：融合后的召回分数
-- `rerank_score`：精排分数；未精排时为 `None`
-- `content`：命中的文本片段
-- `source`：来源文档
-- `metadata`：当前包含 `chunk_index`
-- `retrieval_mode`：结果来源阶段，如 `vector`、`bm25`、`hybrid`、`hybrid_rerank`
-
-## Agent 说明
-
-CLI Agent 的实现位于 `ecommerce_agent_cli.py`，当前特性如下：
-
-- 使用 `ChatTongyi`
-- 使用 LangGraph 编排调用流程
-- 暴露一个检索工具 `search_product_knowledge`
-- 当问题涉及尺码、材质、颜色、洗护、售后等事实信息时，优先检索知识库
-- 如果知识库没有足够信息，会明确表示无法确认，而不是编造答案
-
-这部分很适合作为后续 Web 客服、企业微信机器人或 API 服务的原型。
-
-## 重新构建知识库
-
-如果你修改了 `docs/` 内容，或者想替换成自己的语料，建议显式重建索引。
-
-示例：
+`add_documents()` 是幂等 upsert——通过内容 hash 跟踪变更，未变化的文档自动跳过：
 
 ```python
-from rag_service import RAGService
+result = rag.add_documents(["./docs/商品说明.txt", "./docs/售后政策.pdf"])
+# {
+#     "added_chunks": 12,
+#     "deleted_chunks": 0,
+#     "added_documents": ["./docs/商品说明.txt"],
+#     "updated_documents": ["./docs/售后政策.pdf"],
+#     "skipped_documents": [],
+# }
+```
 
-rag = RAGService(data_dir="data")
-rag.reset()
-rag.add_documents(
-    [
-        "./docs/尺码推荐.txt",
-        "./docs/颜色选择.txt",
-        "./docs/洗涤养护.txt",
-    ]
+其他文档生命周期接口：
+
+```python
+rag.list_documents()                                    # 查看 manifest
+rag.update_document("./docs/商品说明.txt")                # 单文档 upsert
+rag.delete_document("./docs/商品说明.txt")                # 按路径或 doc_id 删除
+rag.sync_documents(file_list, remove_missing=True)       # 与目录扫描结果同步
+```
+
+支持的文档格式：`.txt`、`.md`、`.pdf`。
+
+## 长期记忆
+
+`MemoryService` 管理按用户隔离的长期记忆，与商品知识库完全独立：
+
+```python
+from rag_server import MemoryService
+
+memory = MemoryService(data_dir="memory")
+
+# 写入
+memory.add_memory("user_001", "用户偏好通勤风格，喜欢基础色。")
+
+# 语义检索
+results = memory.search_memory("user_001", "这件适合我平时上班穿吗？")
+
+# 分层检索（profile / episode / procedure）
+layered = memory.search_memory_layers("user_001", "这件适合我平时上班穿吗？")
+
+# 删除
+memory.forget_memory(results[0]["id"], user_id="user_001")
+
+# 清空
+memory.clear_user_memory("user_001")
+```
+
+**三层记忆模型：**
+
+| 层级 | 包含类型 | 用途 |
+|------|----------|------|
+| `profile` | profile / preference / constraint / instruction | 用户偏好、约束、指令 |
+| `episode` | episode | 有复用价值的历史事件摘要 |
+| `procedure` | procedure | 用户要求长期遵循的流程 |
+
+**存储结构：** SQLite 保存结构化记录，FAISS 按用户单独维护语义索引（避免跨用户召回竞争）。
+
+## Anthropic-style Skills
+
+项目级 Skills 放在 `.claude/skills/<skill-name>/SKILL.md`，使用 YAML frontmatter：
+
+```markdown
+---
+name: sizing-advice
+description: Use when the customer asks about clothing size or fit.
+when_to_use: 用户询问尺码相关问题时使用。
+allowed-tools:
+  - search_product_knowledge
+---
+
+# Sizing Advice
+
+这里写该 Skill 的具体指令和工作流程。
+```
+
+**Progressive disclosure 机制：**
+
+1. Agent 启动时只暴露 skill 的 `name`、`description`、`when_to_use`
+2. 模型判断需要时调用 `load_skill(name)` 读取完整内容
+3. 如果 skill 目录有额外文件，可调用 `read_skill_file(name, path)` 读取
+4. 用户也可用 `/skill-name` 前缀显式触发
+
+**Skill 名规则：** 小写字母、数字、连字符（`^[a-z0-9][a-z0-9-]{0,63}$`），目录名必须与 `name` 字段一致。
+
+内置 Skills：
+
+- `sizing-advice`：尺码与版型建议
+- `care-guidance`：洗涤养护建议
+
+## MCP Client
+
+CLI Agent 通过 `langchain-mcp-adapters` 把外部 MCP Server 工具转为 LangChain tools，和本地 RAG、Skills 工具一起暴露给模型。
+
+```bash
+uv run python main.py --mcp on --mcp-config ./mcp_servers.json
+```
+
+配置示例（`mcp_servers.json`）：
+
+```json
+{
+  "tool_name_prefix": true,
+  "servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    },
+    "crm": {
+      "transport": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CRM_MCP_TOKEN}"
+      },
+      "timeout": 10
+    }
+  }
+}
+```
+
+**配置说明：**
+
+- 支持 `stdio`、`http`、`streamable_http`、`sse`、`websocket` 五种 transport
+- 字符串字段支持 `${ENV_VAR}` 和 `${ENV_VAR:-default}` 环境变量替换
+- `tool_name_prefix`（默认开启）为工具名加上 server 前缀，避免重名
+- 单个 server 设置 `"enabled": false` 可临时禁用
+- 也兼容 server 直接放在顶层的扁平格式
+
+## Trace
+
+`TraceRecorder` 以 JSONL 格式记录全链路事件：
+
+```python
+from rag_server import RAGService, TraceRecorder
+
+trace = TraceRecorder(trace_dir="traces")
+rag = RAGService(data_dir="data", trace_recorder=trace)
+rag.search("真丝连衣裙怎么洗？")
+```
+
+CLI 启用：
+
+```bash
+uv run python main.py --trace on --trace-dir traces
+```
+
+记录范围：
+
+- **RAG**：文档 upsert / delete、vector / BM25 / hybrid / rerank / search
+- **Query rewrite**：原 query、改写 query、多 query 检索
+- **Agent**：memory / skill 注入、模型调用、工具调用、memory 写入
+- **Eval**：每条 case 的命中情况和 summary
+
+## 检索评测
+
+评测集支持 JSON 或 JSONL 格式，示例：
+
+```jsonl
+{"id":"silk_care","query":"真丝连衣裙怎么洗？","expected_sources":["docs/洗涤养护.txt"],"expected_substrings":["真丝材质"]}
+```
+
+运行：
+
+```bash
+uv run python -m rag_server.eval_runner \
+  --dataset evals/retrieval_eval.jsonl \
+  --data-dir data \
+  --top-k 3 \
+  --candidate-top-k 10 \
+  --cross-encoder off \
+  --output evals/latest_report.json
+```
+
+输出指标：
+
+| 指标 | 说明 |
+|------|------|
+| `hit_rate` | 同时满足 source 和 substring 匹配的比例 |
+| `mrr` | 第一个命中结果的平均倒数排名 |
+| `source_hit_rate` | source 或 doc_id 命中率 |
+| `substring_hit_rate` | 内容关键词命中率 |
+
+评测默认开启 trace，可用 `--trace off` 关闭。
+
+## RAGService 参数参考
+
+```python
+RAGService(
+    data_dir="data",                        # 索引和元数据保存目录
+    model_name="text-embedding-v4",         # DashScope embedding 模型
+    embeddings=None,                        # 自定义 embedding 对象（测试用）
+    reranker_model_name="BAAI/bge-reranker-v2-m3",  # CrossEncoder 模型
+    reranker=None,                          # 自定义精排器
+    reranker_device=None,                   # 精排设备：cpu / cuda
+    reranker_batch_size=16,                 # 精排批大小
+    default_use_bm25=True,                  # 默认启用 BM25
+    default_use_rerank=True,                # 默认启用精排
+    default_candidate_top_k=20,             # 精排前保留候选数
+    chunk_size=500,                         # 切片大小
+    chunk_overlap=100,                      # 切片重叠（必须小于 chunk_size）
+    trace_recorder=None,                    # 注入 TraceRecorder
 )
 ```
 
-这里有一个很重要的行为需要注意：
+## 项目结构
 
-- `data/faiss.index` 和 `data/metadata.json` 是持久化数据
-- 删除 `docs/` 原文件，不会自动把已入库片段从索引里删掉
-- 如果语料变更较大，最稳妥的做法是先 `reset()` 再重新 `add_documents()`
+```
+.
+├── main.py                     # CLI 启动入口
+├── rag_server/                 # 核心 Python 包
+│   ├── rag_service.py          # RAG 检索服务
+│   ├── cli.py                  # LangGraph Agent + CLI REPL
+│   ├── query_rewrite.py        # query 改写与多 query 融合
+│   ├── memory_service.py       # 用户长期记忆
+│   ├── skill_service.py        # Skills 发现与加载
+│   ├── mcp_service.py          # MCP Client 配置与工具加载
+│   ├── eval_service.py         # 检索评测逻辑
+│   ├── eval_runner.py          # 评测 CLI 入口
+│   └── trace_service.py        # JSONL trace
+├── .claude/skills/             # 项目级 Skills
+├── docs/                       # 示例知识库文档
+├── data/                       # 持久化索引（faiss.index / metadata.json / documents.json）
+├── memory/                     # 用户记忆数据（gitignored）
+├── traces/                     # trace 输出（gitignored）
+├── evals/                      # 评测数据集
+├── examples/                   # 示例脚本
+└── pyproject.toml              # 项目依赖（uv）
+```
 
-## 适合怎么继续扩展
+## 技术栈
 
-这个仓库当前最适合继续往下面几个方向发展：
+| 组件 | 技术选型 |
+|------|----------|
+| 语言 | Python 3.12+ |
+| 包管理 | uv |
+| LLM | ChatTongyi（qwen3-max-2026-01-23）via DashScope |
+| Embedding | DashScope text-embedding-v4 |
+| 向量检索 | FAISS（IndexFlatIP，L2 归一化） |
+| 关键词检索 | jieba 分词 + BM25Plus |
+| 精排 | sentence-transformers CrossEncoder（BAAI/bge-reranker-v2-m3） |
+| Agent 编排 | LangGraph StateGraph |
+| 文档解析 | pypdf（PDF）、原生读取（txt / md） |
+| 分片 | LangChain RecursiveCharacterTextSplitter（中文分隔符） |
+| MCP | langchain-mcp-adapters |
 
-- 加一层 `FastAPI`，把 `search()` 和 Agent 能力暴露成 HTTP 接口
-- 增加文档去重、删除、更新能力
-- 给 `data/metadata.json` 增加更丰富的业务元数据
-- 增加评测集，验证召回与精排效果
-- 为 Agent 增加更多工具，例如订单状态、优惠信息、库存查询
-
-## 一些已知边界
+## 已知边界
 
 - 当前没有 Web 服务层
-- 当前没有“按文档删除已入库数据”的接口，只有整体 `reset()`
-- 当前依赖 DashScope，离线环境下不能直接做向量化或调用 Tongyi
-- 精排模型首次加载会下载权重，部署前最好先预热一次
-
-## 启动命令汇总
-
-安装依赖：
-
-```bash
-uv sync
-```
-
-启动 CLI：
-
-```bash
-uv run python main.py
-```
-
-如果后续要把它集成进你自己的服务，核心入口通常就是：
-
-```python
-from rag_service import RAGService
-```
+- 依赖 DashScope，离线环境无法做向量化或 LLM 调用
+- CrossEncoder 精排模型首次加载会下载权重（~700MB），部署前建议预热
+- 仅支持 `.txt`、`.md`、`.pdf` 格式的文档

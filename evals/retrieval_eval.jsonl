@@ -1,0 +1,4 @@
+{"id":"size_m_recommendation","query":"160cm、95斤适合穿什么尺码？","expected_sources":["docs/尺码推荐.txt"],"expected_substrings":["建议尺码M"]}
+{"id":"formal_color","query":"商务面试穿什么颜色更稳重？","expected_sources":["docs/颜色选择.txt"],"expected_substrings":["正式场合"]}
+{"id":"silk_care","query":"真丝连衣裙怎么洗？","expected_sources":["docs/洗涤养护.txt"],"expected_substrings":["真丝材质"]}
+{"id":"wool_coat_care","query":"厚羊毛大衣可以水洗吗？","expected_sources":["docs/洗涤养护.txt"],"expected_substrings":["必须干洗"]}

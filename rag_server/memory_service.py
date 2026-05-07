@@ -18,6 +18,8 @@ from langchain_community.chat_models import ChatTongyi
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from .llm_retry import LLMRetryPolicy, invoke_with_retry
+
 MEMORY_TYPES = {
     "profile",
     "preference",
@@ -564,9 +566,13 @@ class LLMMemoryExtractor:
         self,
         model_name: str = "qwen3-max-2026-01-23",
         model: ChatTongyi | None = None,
+        retry_policy: LLMRetryPolicy | None = None,
+        trace_recorder: Any | None = None,
     ) -> None:
         self.model_name = model_name
-        self.model = model or ChatTongyi(model=model_name)
+        self.model = model or ChatTongyi(model=model_name, max_retries=0)
+        self.retry_policy = retry_policy or LLMRetryPolicy()
+        self.trace_recorder = trace_recorder
         self.system_prompt = SystemMessage(
             content=(
                 "你是电商客服系统的长期记忆抽取器，只负责判断本轮对话中是否有值得长期保存的用户信息。"
@@ -593,21 +599,35 @@ class LLMMemoryExtractor:
         existing_memories: list[dict] | None = None,
     ) -> list[ExtractedMemory]:
         existing_block = self._format_existing_memories(existing_memories or [])
-        response = self.model.invoke(
-            [
-                self.system_prompt,
-                HumanMessage(
-                    content=(
-                        "请从下面这轮电商客服对话中抽取需要长期记住的用户信息。\n\n"
-                        f"已有相关记忆：\n{existing_block}\n\n"
-                        f"用户消息：{user_message}\n\n"
-                        f"客服回复：{assistant_message}"
-                    )
-                ),
-            ]
+        messages = [
+            self.system_prompt,
+            HumanMessage(
+                content=(
+                    "请从下面这轮电商客服对话中抽取需要长期记住的用户信息。\n\n"
+                    f"已有相关记忆：\n{existing_block}\n\n"
+                    f"用户消息：{user_message}\n\n"
+                    f"客服回复：{assistant_message}"
+                )
+            ),
+        ]
+        response = invoke_with_retry(
+            lambda: self.model.invoke(messages),
+            retry_policy=self.retry_policy,
+            operation="memory_extractor.invoke",
+            on_failure=self._trace_retry_failure,
         )
         payload = self._parse_payload(self._coerce_content(response.content))
         return self._normalize_memories(payload.get("memories"))
+
+    def _trace_retry_failure(self, event: dict[str, Any]) -> None:
+        if self.trace_recorder is None:
+            return
+        self.trace_recorder.event(
+            "model",
+            "memory_extractor.model_retry",
+            {"model_name": self.model_name, **event},
+            level="warning" if event.get("will_retry") else "error",
+        )
 
     def _format_existing_memories(self, memories: list[dict]) -> str:
         if not memories:

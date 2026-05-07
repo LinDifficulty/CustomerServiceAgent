@@ -1,0 +1,18 @@
+{
+  "tool_name_prefix": true,
+  "servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    },
+    "crm": {
+      "transport": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CRM_MCP_TOKEN}"
+      },
+      "timeout": 10
+    }
+  }
+}

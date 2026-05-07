@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import BaseTool, tool
 from langchain_community.chat_models import ChatTongyi
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from .llm_retry import LLMRetryError, LLMRetryPolicy, ainvoke_with_retry
 from .memory_service import LLMMemoryExtractor, MemoryService
 from .mcp_service import DEFAULT_MCP_CONFIG_PATH, load_mcp_tools_from_config
 from .query_rewrite import LLMQueryRewriter, search_with_query_rewrites
@@ -22,6 +30,8 @@ DEFAULT_AGENT_MODEL = "qwen3-max-2026-01-23"
 DEFAULT_USER_ID = "default_user"
 DEFAULT_QUERY_REWRITE_MODE = "on"
 QUERY_REWRITE_MODES = ("on", "off", "rewrite_only", "multi_query")
+DEFAULT_MAX_TOOL_ROUNDS = 6
+DEFAULT_MAX_REPEATED_TOOL_CALLS = 2
 
 
 class AgentState(TypedDict, total=False):
@@ -31,6 +41,9 @@ class AgentState(TypedDict, total=False):
     memory_context: str
     skill_context: str
     active_skill_names: list[str]
+    tool_round_count: int
+    last_tool_call_signature: str
+    repeated_tool_call_count: int
 
 
 def normalize_query_rewrite_mode(mode: str) -> str:
@@ -44,21 +57,27 @@ def format_tongyi_error(
     error: Exception,
 ) -> str:
     """把 Tongyi 的异常转换成更可读的 CLI 错误信息。"""
-    try:
-        params = model._invocation_params(messages=messages, stop=None)
-        response = model.client.call(**params)
-        status_code = response.get("status_code")
-        code = response.get("code")
-        message = response.get("message")
-        request_id = response.get("request_id")
-        if status_code and code and message:
-            return (
-                "大模型调用失败。"
-                f" status_code={status_code}, code={code}, message={message},"
-                f" request_id={request_id}"
-            )
-    except Exception:
-        pass
+    if isinstance(error, LLMRetryError):
+        prefix = (
+            "大模型多次尝试后仍未及时响应或暂时不可用。"
+            if error.attempts > 1
+            else "大模型调用未及时响应或暂时不可用。"
+        )
+        return (
+            f"{prefix} attempts={error.attempts}, "
+            f"last_error={error.last_error!r}"
+        )
+
+    status_code = getattr(error, "status_code", None)
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None)
+    request_id = getattr(error, "request_id", None)
+    if status_code and code and message:
+        return (
+            "大模型调用失败。"
+            f" status_code={status_code}, code={code}, message={message},"
+            f" request_id={request_id}"
+        )
 
     return f"大模型调用失败：{error!r}"
 
@@ -68,6 +87,7 @@ def build_retrieval_tool(
     *,
     query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
     rewrite_model_name: str = DEFAULT_AGENT_MODEL,
+    llm_retry_policy: LLMRetryPolicy | None = None,
     trace_recorder: TraceRecorder | None = None,
 ):
     actual_mode = normalize_query_rewrite_mode(query_rewrite_mode)
@@ -75,6 +95,7 @@ def build_retrieval_tool(
         LLMQueryRewriter(
             model_name=rewrite_model_name,
             trace_recorder=trace_recorder,
+            retry_policy=llm_retry_policy,
         )
         if actual_mode != "off"
         else None
@@ -104,28 +125,62 @@ def build_retrieval_tool_with_rewrite(
             "query_rewrite_mode": actual_query_rewrite_mode,
         }
         if actual_query_rewrite_mode == "rewrite_only" and rewriter is not None:
-            rewrite_result = rewriter.rewrite(question)
-            trace_payload["rewritten_query"] = rewrite_result.rewritten_query
-            trace_payload["retrieval_queries"] = [rewrite_result.rewritten_query]
-            results = rag.search(
-                query=rewrite_result.rewritten_query,
-                top_k=3,
-                candidate_top_k=10,
-            )
+            try:
+                rewrite_result = rewriter.rewrite(question)
+            except Exception as error:
+                trace_payload["query_rewrite_error"] = repr(error)
+                trace_payload["retrieval_queries"] = [question]
+                results = rag.search(
+                    query=question,
+                    top_k=3,
+                    candidate_top_k=10,
+                )
+                if trace_recorder is not None:
+                    trace_recorder.event(
+                        "query_rewrite",
+                        "query_rewrite.fallback_to_original",
+                        trace_payload,
+                        level="warning",
+                    )
+            else:
+                trace_payload["rewritten_query"] = rewrite_result.rewritten_query
+                trace_payload["retrieval_queries"] = [rewrite_result.rewritten_query]
+                results = rag.search(
+                    query=rewrite_result.rewritten_query,
+                    top_k=3,
+                    candidate_top_k=10,
+                )
         elif actual_query_rewrite_mode == "multi_query" and rewriter is not None:
-            rewrite_result = rewriter.rewrite(question)
-            retrieval_queries = [question, *rewrite_result.search_queries]
-            deduplicated_queries = list(dict.fromkeys(retrieval_queries))
-            trace_payload["rewritten_query"] = rewrite_result.rewritten_query
-            trace_payload["retrieval_queries"] = deduplicated_queries
-            results = search_with_query_rewrites(
-                rag,
-                original_query=question,
-                rewritten_queries=deduplicated_queries,
-                top_k=3,
-                candidate_top_k=10,
-                trace_recorder=trace_recorder,
-            )
+            try:
+                rewrite_result = rewriter.rewrite(question)
+            except Exception as error:
+                trace_payload["query_rewrite_error"] = repr(error)
+                trace_payload["retrieval_queries"] = [question]
+                results = rag.search(
+                    query=question,
+                    top_k=3,
+                    candidate_top_k=10,
+                )
+                if trace_recorder is not None:
+                    trace_recorder.event(
+                        "query_rewrite",
+                        "query_rewrite.fallback_to_original",
+                        trace_payload,
+                        level="warning",
+                    )
+            else:
+                retrieval_queries = [question, *rewrite_result.search_queries]
+                deduplicated_queries = list(dict.fromkeys(retrieval_queries))
+                trace_payload["rewritten_query"] = rewrite_result.rewritten_query
+                trace_payload["retrieval_queries"] = deduplicated_queries
+                results = search_with_query_rewrites(
+                    rag,
+                    original_query=question,
+                    rewritten_queries=deduplicated_queries,
+                    top_k=3,
+                    candidate_top_k=10,
+                    trace_recorder=trace_recorder,
+                )
         else:
             trace_payload["retrieval_queries"] = [question]
             results = rag.search(
@@ -374,6 +429,27 @@ def build_tool_map(tools: list[BaseTool]) -> dict[str, BaseTool]:
     return tool_map
 
 
+def tool_call_signature(tool_calls: list[dict[str, Any]]) -> str:
+    comparable = [
+        {
+            "name": item.get("name"),
+            "args": item.get("args") or {},
+        }
+        for item in tool_calls
+    ]
+    return json.dumps(comparable, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def next_repeated_tool_call_count(
+    state: AgentState,
+    tool_calls: list[dict[str, Any]],
+) -> int:
+    signature = tool_call_signature(tool_calls)
+    if signature and signature == state.get("last_tool_call_signature", ""):
+        return int(state.get("repeated_tool_call_count", 0)) + 1
+    return 1
+
+
 def build_agent(
     rag: RAGService,
     *,
@@ -387,13 +463,20 @@ def build_agent(
     mcp_tools: list[BaseTool] | None = None,
     trace_recorder: TraceRecorder | None = None,
     agent_model: Any | None = None,
+    llm_retry_policy: LLMRetryPolicy | None = None,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+    max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS,
 ):
     actual_query_rewrite_mode = normalize_query_rewrite_mode(query_rewrite_mode)
+    retry_policy = llm_retry_policy or LLMRetryPolicy()
+    max_tool_rounds = max(0, max_tool_rounds)
+    max_repeated_tool_calls = max(1, max_repeated_tool_calls)
     rewriter = None
     if actual_query_rewrite_mode != "off":
         rewriter = LLMQueryRewriter(
             model_name=rewrite_model_name,
             trace_recorder=trace_recorder,
+            retry_policy=retry_policy,
         )
 
     retrieval_tool = build_retrieval_tool_with_rewrite(
@@ -410,7 +493,7 @@ def build_agent(
     )
     tools = [retrieval_tool, *skill_tools, *(mcp_tools or [])]
     tool_map = build_tool_map(tools)
-    base_model = agent_model or ChatTongyi(model=DEFAULT_AGENT_MODEL)
+    base_model = agent_model or ChatTongyi(model=DEFAULT_AGENT_MODEL, max_retries=0)
     model = base_model.bind_tools(tools)
 
     system_prompt = SystemMessage(
@@ -506,6 +589,16 @@ def build_agent(
             )
         return update
 
+    def trace_model_retry_failure(event: dict[str, Any]) -> None:
+        if trace_recorder is None:
+            return
+        trace_recorder.event(
+            "model",
+            "agent.model_retry",
+            event,
+            level="warning" if event.get("will_retry") else "error",
+        )
+
     async def call_model(state: AgentState) -> AgentState:
         prompt_messages: list[BaseMessage] = [system_prompt]
         memory_context = state.get("memory_context", "")
@@ -534,7 +627,13 @@ def build_agent(
                     "conversation_message_count": len(state["messages"]),
                 },
             )
-        response = await model.ainvoke([*prompt_messages, *state["messages"]])
+        model_messages = [*prompt_messages, *state["messages"]]
+        response = await ainvoke_with_retry(
+            lambda: model.ainvoke(model_messages),
+            retry_policy=retry_policy,
+            operation="agent.model_ainvoke",
+            on_failure=trace_model_retry_failure,
+        )
         if trace_recorder is not None:
             trace_recorder.event(
                 "model",
@@ -558,13 +657,78 @@ def build_agent(
     def route_tools(state: AgentState) -> str:
         last_message = state["messages"][-1]
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            tool_round_count = int(state.get("tool_round_count", 0))
+            repeated_tool_calls = next_repeated_tool_call_count(
+                state,
+                last_message.tool_calls,
+            )
+            if (
+                tool_round_count >= max_tool_rounds
+                or repeated_tool_calls > max_repeated_tool_calls
+            ):
+                return "loop_guard"
             return "tools"
         return "save_memory"
+
+    def stop_tool_loop(state: AgentState) -> AgentState:
+        last_message = state["messages"][-1]
+        tool_calls = (
+            last_message.tool_calls
+            if isinstance(last_message, AIMessage) and last_message.tool_calls
+            else []
+        )
+        tool_round_count = int(state.get("tool_round_count", 0))
+        repeated_tool_calls = next_repeated_tool_call_count(state, tool_calls)
+        reason = (
+            "max_tool_rounds"
+            if tool_round_count >= max_tool_rounds
+            else "repeated_tool_calls"
+        )
+        tool_names = [str(item.get("name", "")) for item in tool_calls]
+        if trace_recorder is not None:
+            trace_recorder.event(
+                "agent",
+                "agent.tool_loop_guard",
+                {
+                    "reason": reason,
+                    "tool_round_count": tool_round_count,
+                    "max_tool_rounds": max_tool_rounds,
+                    "repeated_tool_call_count": repeated_tool_calls,
+                    "max_repeated_tool_calls": max_repeated_tool_calls,
+                    "tool_names": tool_names,
+                },
+                level="warning",
+            )
+        aborted_tool_messages = [
+            ToolMessage(
+                content="工具调用已中止：触发循环保护。",
+                tool_call_id=str(item.get("id", "")),
+            )
+            for item in tool_calls
+            if item.get("id")
+        ]
+        return {
+            "messages": [
+                *aborted_tool_messages,
+                AIMessage(
+                    content=(
+                        "抱歉，我这边连续调用工具后仍无法稳定完成本次处理，"
+                        "为避免无效循环已先停止。请稍后再试，或把问题拆得更具体一些。"
+                    )
+                ),
+            ]
+        }
 
     async def call_tools(state: AgentState) -> AgentState:
         last_message = state["messages"][-1]
         tool_messages = []
         active_skill_names = list(state.get("active_skill_names", []))
+        current_signature = tool_call_signature(last_message.tool_calls)
+        repeated_tool_call_count = next_repeated_tool_call_count(
+            state,
+            last_message.tool_calls,
+        )
+        tool_round_count = int(state.get("tool_round_count", 0)) + 1
 
         def allowed_tool_names() -> set[str] | None:
             if actual_skill_registry is None or not active_skill_names:
@@ -642,6 +806,9 @@ def build_agent(
         return {
             "messages": tool_messages,
             "active_skill_names": active_skill_names,
+            "tool_round_count": tool_round_count,
+            "last_tool_call_signature": current_signature,
+            "repeated_tool_call_count": repeated_tool_call_count,
         }
 
     def save_memory(state: AgentState) -> AgentState:
@@ -758,6 +925,7 @@ def build_agent(
     graph.add_node("load_skills", load_skills)
     graph.add_node("agent", call_model)
     graph.add_node("tools", call_tools)
+    graph.add_node("loop_guard", stop_tool_loop)
     graph.add_node("save_memory", save_memory)
     graph.add_edge(START, "load_memory")
     graph.add_edge("load_memory", "load_skills")
@@ -765,9 +933,14 @@ def build_agent(
     graph.add_conditional_edges(
         "agent",
         route_tools,
-        {"tools": "tools", "save_memory": "save_memory"},
+        {
+            "tools": "tools",
+            "loop_guard": "loop_guard",
+            "save_memory": "save_memory",
+        },
     )
     graph.add_edge("tools", "agent")
+    graph.add_edge("loop_guard", "save_memory")
     graph.add_edge("save_memory", END)
     return graph.compile(), base_model, system_prompt
 
@@ -787,8 +960,18 @@ async def run_cli_async(
     mcp_config_path: str = DEFAULT_MCP_CONFIG_PATH,
     trace_enabled: bool = False,
     trace_dir: str = DEFAULT_TRACE_DIR,
+    llm_retry_attempts: int = 3,
+    llm_timeout_s: float | None = 30.0,
+    llm_retry_backoff_s: float = 1.0,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+    max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS,
 ) -> None:
     actual_query_rewrite_mode = normalize_query_rewrite_mode(query_rewrite_mode)
+    llm_retry_policy = LLMRetryPolicy(
+        max_attempts=llm_retry_attempts,
+        per_attempt_timeout_s=llm_timeout_s,
+        initial_backoff_s=llm_retry_backoff_s,
+    )
     trace_recorder = (
         TraceRecorder(
             trace_dir=trace_dir,
@@ -805,7 +988,11 @@ async def run_cli_async(
     )
     memory_service = MemoryService(data_dir="memory") if memory_enabled else None
     memory_extractor = (
-        LLMMemoryExtractor(model_name=memory_model_name)
+        LLMMemoryExtractor(
+            model_name=memory_model_name,
+            retry_policy=llm_retry_policy,
+            trace_recorder=trace_recorder,
+        )
         if memory_service is not None
         else None
     )
@@ -833,6 +1020,9 @@ async def run_cli_async(
         skill_registry=skill_registry,
         mcp_tools=mcp_tools,
         trace_recorder=trace_recorder,
+        llm_retry_policy=llm_retry_policy,
+        max_tool_rounds=max_tool_rounds,
+        max_repeated_tool_calls=max_repeated_tool_calls,
     )
     messages: list[BaseMessage] = []
 
@@ -841,6 +1031,17 @@ async def run_cli_async(
     print(f"当前 BM25 模式: {'on' if bm25_enabled else 'off'}")
     print(f"当前 CrossEncoder 精排模式: {'on' if cross_encoder_enabled else 'off'}")
     print(f"当前 memory 模式: {'on' if memory_enabled else 'off'}")
+    print(
+        "当前 LLM 重试策略: "
+        f"attempts={llm_retry_policy.normalized().max_attempts}, "
+        f"timeout={llm_retry_policy.normalized().per_attempt_timeout_s}s, "
+        f"backoff={llm_retry_policy.normalized().initial_backoff_s}s"
+    )
+    print(
+        "当前工具循环保护: "
+        f"max_tool_rounds={max_tool_rounds}, "
+        f"max_repeated_tool_calls={max_repeated_tool_calls}"
+    )
     if trace_recorder is not None:
         print(f"当前 trace 模式: on ({trace_recorder.path})")
     else:
@@ -924,7 +1125,7 @@ def parse_args() -> argparse.Namespace:
         "--cross-encoder",
         choices=["on", "off"],
         default="off",
-        help="Enable or disable CrossEncoder reranking. Defaults to on.",
+        help="Enable or disable CrossEncoder reranking. Defaults to off.",
     )
     parser.add_argument(
         "--rewrite-model",
@@ -987,6 +1188,45 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TRACE_DIR,
         help=f"Directory for JSONL trace files. Defaults to {DEFAULT_TRACE_DIR}.",
     )
+    parser.add_argument(
+        "--llm-retry-attempts",
+        type=int,
+        default=3,
+        help="Maximum attempts for each LLM call. Defaults to 3.",
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "Per-attempt LLM timeout in seconds. "
+            "Use 0 or a negative value to disable timeout. Defaults to 30."
+        ),
+    )
+    parser.add_argument(
+        "--llm-retry-backoff",
+        type=float,
+        default=1.0,
+        help="Initial retry backoff in seconds. Defaults to 1.",
+    )
+    parser.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=DEFAULT_MAX_TOOL_ROUNDS,
+        help=(
+            "Maximum Agent tool-call rounds per user turn. "
+            f"Defaults to {DEFAULT_MAX_TOOL_ROUNDS}."
+        ),
+    )
+    parser.add_argument(
+        "--max-repeated-tool-calls",
+        type=int,
+        default=DEFAULT_MAX_REPEATED_TOOL_CALLS,
+        help=(
+            "Maximum repeated identical tool-call rounds per user turn. "
+            f"Defaults to {DEFAULT_MAX_REPEATED_TOOL_CALLS}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1006,6 +1246,11 @@ def main() -> None:
         mcp_config_path=args.mcp_config,
         trace_enabled=args.trace == "on",
         trace_dir=args.trace_dir,
+        llm_retry_attempts=args.llm_retry_attempts,
+        llm_timeout_s=args.llm_timeout if args.llm_timeout > 0 else None,
+        llm_retry_backoff_s=args.llm_retry_backoff,
+        max_tool_rounds=args.max_tool_rounds,
+        max_repeated_tool_calls=args.max_repeated_tool_calls,
     )
 
 

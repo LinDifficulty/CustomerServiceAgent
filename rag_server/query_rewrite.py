@@ -8,6 +8,7 @@ from typing import Any
 from langchain_community.chat_models import ChatTongyi
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from .llm_retry import LLMRetryPolicy, invoke_with_retry
 from .rag_service import RAGService
 from .trace_service import TraceRecorder, summarize_result
 
@@ -29,10 +30,12 @@ class LLMQueryRewriter:
         model_name: str = "qwen3-max-2026-01-23",
         model: ChatTongyi | None = None,
         trace_recorder: TraceRecorder | None = None,
+        retry_policy: LLMRetryPolicy | None = None,
     ) -> None:
         self.model_name = model_name
-        self.model = model or ChatTongyi(model=model_name)
+        self.model = model or ChatTongyi(model=model_name, max_retries=0)
         self.trace_recorder = trace_recorder
+        self.retry_policy = retry_policy or LLMRetryPolicy()
         self.system_prompt = SystemMessage(
             content=(
                 "你是一个RAG检索改写器，只负责把用户问题改写成更适合知识库检索的查询。"
@@ -48,16 +51,20 @@ class LLMQueryRewriter:
 
     def rewrite(self, query: str) -> QueryRewriteResult:
         start = time.perf_counter()
-        response = self.model.invoke(
-            [
-                self.system_prompt,
-                HumanMessage(
-                    content=(
-                        "请改写下面这条用户问题，用于商品知识库检索。\n"
-                        f"用户问题：{query}"
-                    )
-                ),
-            ]
+        messages = [
+            self.system_prompt,
+            HumanMessage(
+                content=(
+                    "请改写下面这条用户问题，用于商品知识库检索。\n"
+                    f"用户问题：{query}"
+                )
+            ),
+        ]
+        response = invoke_with_retry(
+            lambda: self.model.invoke(messages),
+            retry_policy=self.retry_policy,
+            operation="query_rewrite.invoke",
+            on_failure=self._trace_retry_failure,
         )
         raw_response = self._coerce_content(response.content)
         payload = self._parse_payload(raw_response)
@@ -89,6 +96,16 @@ class LLMQueryRewriter:
                 },
             )
         return result
+
+    def _trace_retry_failure(self, event: dict[str, Any]) -> None:
+        if self.trace_recorder is None:
+            return
+        self.trace_recorder.event(
+            "model",
+            "query_rewrite.model_retry",
+            {"model_name": self.model_name, **event},
+            level="warning" if event.get("will_retry") else "error",
+        )
 
     def _coerce_content(self, content: Any) -> str:
         if isinstance(content, str):

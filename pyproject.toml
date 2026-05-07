@@ -1,7 +1,7 @@
 [project]
 name = "rag-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reusable local RAG and ecommerce agent components for Chinese knowledge-base workflows."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,3 +21,13 @@ dependencies = [
     "sentence-transformers>=5.4.1",
     "setuptools<81",
 ]
+
+[project.scripts]
+rag-cli = "rag_server.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rag_server*"]

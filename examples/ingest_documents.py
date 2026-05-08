@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from rag_server import RAGService
+from rag_server.model_factory import DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_PROVIDER
 from rag_server.rag_service import SUPPORTED_EXTENSIONS
 
 
@@ -30,6 +31,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--keep-missing",
         action="store_true",
         help="Keep indexed documents that are no longer present in docs-dir.",
+    )
+    parser.add_argument(
+        "--embedding-provider",
+        default=DEFAULT_EMBEDDING_PROVIDER,
+        help="Provider used by the embedding model.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="Embedding model name.",
     )
     return parser
 
@@ -59,7 +70,11 @@ def main(argv: list[str] | None = None) -> None:
     if not file_paths:
         raise SystemExit(f"No supported documents found in {docs_dir}")
 
-    rag = RAGService(data_dir=args.data_dir)
+    rag = RAGService(
+        data_dir=args.data_dir,
+        embedding_provider=args.embedding_provider,
+        embedding_model_name=args.embedding_model,
+    )
     result = rag.sync_documents(
         file_paths,
         remove_missing=not args.keep_missing,

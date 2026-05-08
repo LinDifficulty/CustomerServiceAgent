@@ -12,7 +12,7 @@
 
 ## 使用前先知道
 
-- 所有向量化和 LLM 默认依赖 DashScope，必须设置 `DASHSCOPE_API_KEY`
+- 默认向量化和 LLM provider 依赖 DashScope / Tongyi，使用默认配置时必须设置 `DASHSCOPE_API_KEY`
 - 当前没有 Web 服务层；对外入口是 Python 接口和 CLI
 - CrossEncoder 精排默认关闭；首次开启会下载 `BAAI/bge-reranker-v2-m3` 权重，体积约 700MB
 - 索引和记忆基于本地文件持久化，更适合单机、单写入者场景
@@ -40,7 +40,7 @@ uv sync
 export DASHSCOPE_API_KEY="你的 DashScope 密钥"
 ```
 
-默认嵌入模型是 DashScope `text-embedding-v4`，默认智能体 / 查询改写 / 记忆抽取器模型是 `qwen3-max-2026-01-23`。
+默认 provider 仍是 DashScope / Tongyi：嵌入模型 `text-embedding-v4`，智能体、查询改写、记忆抽取器模型 `qwen3-max-2026-01-23`。聊天、嵌入、重排序和查询改写模型都可以通过 provider + model 独立替换；provider 支持内置名称，也支持 Python import path。
 
 ### 3. 把示例文档入库
 
@@ -67,6 +67,7 @@ uv run python main.py
 ## 核心组件
 
 - `RAGService`：多向量检索、BM25、混合召回、CrossEncoder 精排、文档生命周期管理
+- `model_factory`：集中创建聊天、嵌入和重排序模型，业务模块不再直接绑定某个厂商 SDK
 - `CLI Agent`：基于 LangGraph 的命令行客服智能体
 - `LLMQueryRewriter`：查询改写和多查询融合检索
 - `MemoryService`：按用户隔离的长期记忆
@@ -139,8 +140,15 @@ uv run rag-cli --help
 | `--config` | 无 | 读取 `.toml` / `.json` 配置文件；也可用 `RAG_SERVER_CONFIG` |
 | `--data-dir` | `data` | RAG 索引与元数据目录 |
 | `--memory-dir` | `memory` | 长期记忆目录 |
+| `--agent-provider` / `--chat-provider` | `tongyi` | 智能体聊天模型 provider |
 | `--agent-model` | `qwen3-max-2026-01-23` | 智能体主模型 |
+| `--embedding-provider` | `dashscope` | 嵌入模型 provider |
+| `--embedding-model` | `text-embedding-v4` | 嵌入模型 |
+| `--reranker-provider` | `cross_encoder` | 精排模型 provider |
+| `--reranker-model` | `BAAI/bge-reranker-v2-m3` | 精排模型 |
+| `--rewrite-provider` | 同智能体 provider | 查询改写模型 provider |
 | `--rewrite-model` | 同智能体模型 | 查询改写使用的模型 |
+| `--memory-provider` | 同智能体 provider | 长期记忆抽取模型 provider |
 | `--memory-model` | 同智能体模型 | 长期记忆抽取使用的模型 |
 | `--reflection` | `on` | 是否启用回答后反思、补检索和修正 |
 | `--query-rewrite` | `on` | 改写模式：`on` / `off` / `rewrite_only` / `multi_query` |
@@ -154,7 +162,8 @@ uv run rag-cli --help
 | `--mcp-config` | `mcp_servers.json` | MCP 服务器 JSON 配置路径 |
 | `--trace` | `off` | 是否写入 JSONL 追踪 |
 | `--trace-dir` | `traces` | 追踪 JSONL 输出目录 |
-| `--live-events` | `on` | 是否在 CLI 实时展示 RAG、记忆、技能、MCP 调用 |
+| `--live-events` / `--live-logs` | `on` | 是否在 CLI 实时展示 RAG、记忆、技能、MCP 调用日志 |
+| `--show-config` | `on` | 是否在 CLI 启动时展示当前模型、目录和开关配置 |
 | `--user-id` | `default_user` | 用户记忆隔离标识 |
 | `--llm-retry-attempts` | `3` | 每次 LLM 调用最多尝试次数 |
 | `--llm-timeout` | `30` | 每次 LLM 尝试的超时时间，单位秒；传 `0` 或负数可关闭 |
@@ -171,6 +180,13 @@ uv run rag-cli --query-rewrite off --bm25 off
 # 开启精排和追踪
 uv run rag-cli --cross-encoder on --trace on
 
+# 独立替换聊天、嵌入、精排和 query 改写模型
+uv run rag-cli \
+  --chat-provider tongyi --chat-model qwen3-max-2026-01-23 \
+  --embedding-provider dashscope --embedding-model text-embedding-v4 \
+  --reranker-provider cross_encoder --reranker-model BAAI/bge-reranker-v2-m3 \
+  --rewrite-provider tongyi --rewrite-model qwen3-max-2026-01-23
+
 # 使用指定用户记忆空间
 uv run rag-cli --user-id user_001
 
@@ -185,7 +201,20 @@ uv run rag-cli --mcp on --max-tool-rounds 4 --max-repeated-tool-calls 1
 
 # 关闭 CLI 实时事件，只保留正常对话输出
 uv run rag-cli --live-events off
+
+# 关闭启动时的配置摘要输出
+uv run rag-cli --show-config off
 ```
+
+### 模型 provider
+
+内置 provider：
+
+- 聊天模型：`tongyi`，可选 `openai`（需要本地安装 `langchain-openai`）
+- 嵌入模型：`dashscope`，可选 `openai`（需要本地安装 `langchain-openai`）
+- 重排序模型：`cross_encoder`
+
+自定义 provider 可以写成 `package.module:Factory` 或 `package.module.Factory`。聊天 provider 需要返回兼容 LangChain chat model 的对象；嵌入 provider 需要实现 `embed_documents()`，最好也实现 `embed_query()`；重排序 provider 需要实现 `predict(pairs, batch_size=..., show_progress_bar=False)`。
 
 ### CLI 内置命令
 
@@ -297,7 +326,9 @@ trace_dir = "traces"
 mcp_config_path = "mcp_servers.json"
 
 [agent]
+provider = "tongyi"
 model = "qwen3-max-2026-01-23"
+model_kwargs = {}
 user_id = "default_user"
 max_tool_rounds = 6
 max_repeated_tool_calls = 2
@@ -307,10 +338,22 @@ reflection_enabled = true
 query_rewrite = "on"
 bm25 = true
 cross_encoder = false
+embedding_provider = "dashscope"
+embedding_model = "text-embedding-v4"
+embedding_kwargs = {}
+reranker_provider = "cross_encoder"
+reranker_model = "BAAI/bge-reranker-v2-m3"
+reranker_kwargs = {}
+reranker_device = ""
+reranker_batch_size = 16
 
 [llm]
+rewrite_provider = "tongyi"
 rewrite_model = "qwen3-max-2026-01-23"
+rewrite_kwargs = {}
+memory_provider = "tongyi"
 memory_model = "qwen3-max-2026-01-23"
+memory_kwargs = {}
 retry_attempts = 3
 timeout_s = 30
 retry_backoff_s = 1
@@ -329,9 +372,12 @@ enabled = false
 [trace]
 enabled = false
 live = true
+
+[cli]
+show_config = true
 ```
 
-常用环境变量与配置字段一一对应，例如 `RAG_SERVER_DATA_DIR`、`RAG_SERVER_MEMORY_DIR`、`RAG_SERVER_AGENT_MODEL`、`RAG_SERVER_REWRITE_MODEL`、`RAG_SERVER_MEMORY_MODEL`、`RAG_SERVER_REFLECTION`、`RAG_SERVER_QUERY_REWRITE`、`RAG_SERVER_BM25`、`RAG_SERVER_CROSS_ENCODER`、`RAG_SERVER_SKILLS_DIRS`、`RAG_SERVER_MCP_CONFIG`、`RAG_SERVER_TRACE` 和 `RAG_SERVER_LIVE_EVENTS`。布尔值支持 `on/off`、`true/false`、`yes/no`、`1/0`；`RAG_SERVER_SKILLS_DIRS` 支持逗号分隔多个目录。
+常用环境变量与配置字段一一对应，例如 `RAG_SERVER_DATA_DIR`、`RAG_SERVER_MEMORY_DIR`、`RAG_SERVER_AGENT_MODEL`、`RAG_SERVER_REWRITE_MODEL`、`RAG_SERVER_MEMORY_MODEL`、`RAG_SERVER_REFLECTION`、`RAG_SERVER_QUERY_REWRITE`、`RAG_SERVER_BM25`、`RAG_SERVER_CROSS_ENCODER`、`RAG_SERVER_SKILLS_DIRS`、`RAG_SERVER_MCP_CONFIG`、`RAG_SERVER_TRACE`、`RAG_SERVER_LIVE_EVENTS`、`RAG_SERVER_LIVE_LOGS` 和 `RAG_SERVER_CLI_SHOW_CONFIG`。布尔值支持 `on/off`、`true/false`、`yes/no`、`1/0`；`RAG_SERVER_SKILLS_DIRS` 支持逗号分隔多个目录。
 
 ### 追踪
 
@@ -341,7 +387,7 @@ uv run rag-cli --trace on --trace-dir traces
 
 `TraceRecorder` 会记录 RAG、查询改写、反思、智能体、记忆、技能、MCP、评测等链路事件，输出为 JSONL。开启追踪后，启动配置、单轮对话耗时、模型用量元数据、LLM 重试失败、查询改写降级和智能体工具循环保护也会被记录。追踪会自动脱敏常见敏感键名，例如 `api_key`、`authorization`、`password`、`token`、`secret`。
 
-CLI 默认会实时打印 RAG 检索、记忆读取、技能加载/读取和 MCP 工具调用事件；它不要求开启 JSONL 追踪。需要安静输出时可用 `--live-events off`，或设置 `RAG_SERVER_LIVE_EVENTS=off`。
+CLI 默认会实时打印 RAG 检索、记忆读取、技能加载/读取和 MCP 工具调用事件；它不要求开启 JSONL 追踪。需要安静输出时可用 `--live-events off` / `--live-logs off`，或设置 `RAG_SERVER_LIVE_EVENTS=off` / `RAG_SERVER_LIVE_LOGS=off`。启动时的模型、目录和开关摘要可用 `--show-config off` 或 `RAG_SERVER_CLI_SHOW_CONFIG=off` 关闭。
 
 ### 检索评测
 
@@ -411,7 +457,7 @@ uv run python -m unittest discover -s tests -v
 ## 已知边界
 
 - 当前没有 HTTP / Web 服务层
-- 所有模型能力默认依赖 DashScope，离线环境无法完成嵌入或 LLM 调用
+- 默认模型能力依赖 DashScope / Tongyi；可通过 provider 配置替换为其他 LangChain 兼容模型或自定义 provider
 - LLM 重试是有上限的保护机制，不保证模型服务故障时一定成功；重试耗尽后会返回错误或走降级路径
-- CrossEncoder 首次启用会下载较大的模型权重
+- 默认 CrossEncoder 首次启用会下载较大的模型权重
 - 本地文件写入没有做多进程并发保护

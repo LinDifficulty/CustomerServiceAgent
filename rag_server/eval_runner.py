@@ -4,6 +4,12 @@ import argparse
 import json
 
 from .eval_service import evaluate_retrieval_dataset, write_eval_report
+from .model_factory import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+    DEFAULT_RERANKER_MODEL,
+    DEFAULT_RERANKER_PROVIDER,
+)
 from .rag_service import RAGService
 from .trace_service import DEFAULT_TRACE_DIR, TraceRecorder, load_trace, summarize_trace
 
@@ -43,6 +49,37 @@ def parse_args() -> argparse.Namespace:
         choices=["on", "off"],
         default="on",
         help="Enable or disable CrossEncoder reranking during eval.",
+    )
+    parser.add_argument(
+        "--embedding-provider",
+        default=DEFAULT_EMBEDDING_PROVIDER,
+        help="Provider used by the embedding model.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="Embedding model name.",
+    )
+    parser.add_argument(
+        "--reranker-provider",
+        default=DEFAULT_RERANKER_PROVIDER,
+        help="Provider used by reranking.",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        default=DEFAULT_RERANKER_MODEL,
+        help="Reranker model name.",
+    )
+    parser.add_argument(
+        "--reranker-device",
+        default=None,
+        help="Optional reranker device, such as cpu, cuda, or mps.",
+    )
+    parser.add_argument(
+        "--reranker-batch-size",
+        type=int,
+        default=16,
+        help="Batch size used by reranker predict().",
     )
     parser.add_argument(
         "--output",
@@ -87,6 +124,12 @@ def main() -> None:
     )
     rag = RAGService(
         data_dir=args.data_dir,
+        embedding_provider=args.embedding_provider,
+        embedding_model_name=args.embedding_model,
+        reranker_provider=args.reranker_provider,
+        reranker_model_name=args.reranker_model,
+        reranker_device=args.reranker_device,
+        reranker_batch_size=args.reranker_batch_size,
         default_use_bm25=args.bm25 == "on",
         default_use_rerank=args.cross_encoder == "on",
         trace_recorder=trace_recorder,

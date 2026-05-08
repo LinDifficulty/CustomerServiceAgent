@@ -15,11 +15,18 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import faiss
 import numpy as np
-from langchain_community.chat_models import ChatTongyi
-from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .llm_retry import LLMRetryPolicy, invoke_with_retry
+from .model_factory import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_CHAT_PROVIDER,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+    create_chat_model,
+    create_embeddings,
+    model_config_fingerprint,
+)
 from .utils import coerce_message_content, parse_json_object
 
 MEMORY_TYPES = {
@@ -72,7 +79,10 @@ class MemoryService:
     def __init__(
         self,
         data_dir: str = "memory",
-        model_name: str = "text-embedding-v4",
+        model_name: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER,
+        embedding_model_name: str | None = None,
+        embedding_model_kwargs: dict[str, Any] | None = None,
         embeddings: Any | None = None,
         trace_recorder: Any | None = None,
     ) -> None:
@@ -82,13 +92,27 @@ class MemoryService:
         self.sqlite_path = self.base_dir / "memory.sqlite"
         self.index_dir = self.base_dir / "indexes"
         self.index_dir.mkdir(parents=True, exist_ok=True)
-        self.embeddings = embeddings or DashScopeEmbeddings(model=model_name)
+        self.embedding_config_path = self.base_dir / "embedding_config.json"
+        self.embedding_provider = embedding_provider
+        self.embedding_model_name = embedding_model_name or model_name
+        self.embedding_model_kwargs = dict(embedding_model_kwargs or {})
+        self.embedding_config_hash = model_config_fingerprint(
+            self.embedding_provider,
+            self.embedding_model_name,
+            self.embedding_model_kwargs,
+        )
+        self.embeddings = embeddings or create_embeddings(
+            provider=self.embedding_provider,
+            model_name=self.embedding_model_name,
+            **self.embedding_model_kwargs,
+        )
         self.trace_recorder = trace_recorder
         self._index_cache: dict[str, tuple[faiss.Index | None, list[str]]] = {}
 
         self.conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
+        self._ensure_embedding_config()
 
     def add_memory(
         self,
@@ -495,6 +519,40 @@ class MemoryService:
                 """
             )
 
+    def _ensure_embedding_config(self) -> None:
+        current = {
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model_name,
+            "embedding_config_hash": self.embedding_config_hash,
+        }
+        if self._load_embedding_config() == current:
+            return
+
+        self._index_cache.clear()
+        for path in self.index_dir.glob("*.faiss"):
+            path.unlink()
+        for path in self.index_dir.glob("*.ids.json"):
+            path.unlink()
+        self.embedding_config_path.write_text(
+            json.dumps(current, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_embedding_config(self) -> dict[str, Any] | None:
+        if not self.embedding_config_path.exists():
+            return None
+        try:
+            payload = json.loads(self.embedding_config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "embedding_provider": str(payload.get("embedding_provider") or ""),
+            "embedding_model": str(payload.get("embedding_model") or ""),
+            "embedding_config_hash": str(payload.get("embedding_config_hash") or ""),
+        }
+
     def _active_rows(self, user_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             """
@@ -672,13 +730,21 @@ class LLMMemoryExtractor:
 
     def __init__(
         self,
-        model_name: str = "qwen3-max-2026-01-23",
-        model: ChatTongyi | None = None,
+        model_name: str = DEFAULT_CHAT_MODEL,
+        provider: str = DEFAULT_CHAT_PROVIDER,
+        model_kwargs: dict[str, Any] | None = None,
+        model: Any | None = None,
         retry_policy: LLMRetryPolicy | None = None,
         trace_recorder: Any | None = None,
     ) -> None:
+        self.provider = provider
         self.model_name = model_name
-        self.model = model or ChatTongyi(model=model_name, max_retries=0)
+        self.model_kwargs = dict(model_kwargs or {})
+        self.model = model or create_chat_model(
+            provider=provider,
+            model_name=model_name,
+            **self.model_kwargs,
+        )
         self.retry_policy = retry_policy or LLMRetryPolicy()
         self.trace_recorder = trace_recorder
         self.system_prompt = SystemMessage(
@@ -733,7 +799,7 @@ class LLMMemoryExtractor:
         self.trace_recorder.event(
             "model",
             "memory_extractor.model_retry",
-            {"model_name": self.model_name, **event},
+            {"provider": self.provider, "model_name": self.model_name, **event},
             level="warning" if event.get("will_retry") else "error",
         )
 

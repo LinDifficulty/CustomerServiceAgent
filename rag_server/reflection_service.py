@@ -4,15 +4,15 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_community.chat_models import ChatTongyi
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .llm_retry import LLMRetryPolicy, ainvoke_with_retry
+from .model_factory import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, create_chat_model
 from .rag_service import RAGService
 from .trace_service import TraceRecorder, preview_text, summarize_result
 from .utils import coerce_bool, coerce_message_content, parse_json_object
 
-DEFAULT_REFLECTION_MODEL = "qwen3-max-2026-01-23"
+DEFAULT_REFLECTION_MODEL = DEFAULT_CHAT_MODEL
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,8 @@ class ReflectionAgent:
         *,
         rag: RAGService,
         model_name: str = DEFAULT_REFLECTION_MODEL,
+        provider: str = DEFAULT_CHAT_PROVIDER,
+        model_kwargs: dict[str, Any] | None = None,
         model: Any | None = None,
         retry_policy: LLMRetryPolicy | None = None,
         trace_recorder: TraceRecorder | None = None,
@@ -46,8 +48,14 @@ class ReflectionAgent:
         supplemental_candidate_top_k: int = 10,
     ) -> None:
         self.rag = rag
+        self.provider = provider
         self.model_name = model_name
-        self.model = model or ChatTongyi(model=model_name, max_retries=0)
+        self.model_kwargs = dict(model_kwargs or {})
+        self.model = model or create_chat_model(
+            provider=provider,
+            model_name=model_name,
+            **self.model_kwargs,
+        )
         self.retry_policy = retry_policy or LLMRetryPolicy()
         self.trace_recorder = trace_recorder
         self.supplemental_top_k = supplemental_top_k
@@ -255,7 +263,7 @@ class ReflectionAgent:
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
         self._trace_event(
             "reflection.model_retry",
-            {"model_name": self.model_name, **event},
+            {"provider": self.provider, "model_name": self.model_name, **event},
             level="warning" if event.get("will_retry") else "error",
         )
 

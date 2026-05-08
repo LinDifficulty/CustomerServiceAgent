@@ -12,12 +12,19 @@ from typing import Any
 
 import faiss
 import numpy as np
-from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from rank_bm25 import BM25Plus
-from sentence_transformers import CrossEncoder
 
+from .model_factory import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+    DEFAULT_RERANKER_MODEL,
+    DEFAULT_RERANKER_PROVIDER,
+    create_embeddings,
+    create_reranker,
+    model_config_fingerprint,
+)
 from .trace_service import TraceRecorder, summarize_result
 
 with warnings.catch_warnings():
@@ -77,18 +84,23 @@ class RAGService:
     """轻量 RAG 服务。
 
     支持：
-    1. DashScope 向量化 + FAISS 多向量检索
+    1. 可配置 embedding provider + FAISS 多向量检索
     2. BM25 关键词检索
     3. 向量 + BM25 混合召回
-    4. Cross-Encoder 精排
+    4. 可配置 reranker provider 精排
     """
 
     def __init__(
         self,
         data_dir: str = "data",
-        model_name: str = "text-embedding-v4",
+        model_name: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER,
+        embedding_model_name: str | None = None,
+        embedding_model_kwargs: dict[str, Any] | None = None,
         embeddings: Any | None = None,
-        reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
+        reranker_provider: str = DEFAULT_RERANKER_PROVIDER,
+        reranker_model_name: str = DEFAULT_RERANKER_MODEL,
+        reranker_model_kwargs: dict[str, Any] | None = None,
         reranker: Any | None = None,
         reranker_device: str | None = None,
         reranker_batch_size: int = 16,
@@ -124,11 +136,25 @@ class RAGService:
             parent_chunk_overlap=self.parent_chunk_overlap,
         )
 
-        # 向量模型默认使用 DashScope，也支持外部传入自定义 embeddings。
-        self.embeddings = embeddings or DashScopeEmbeddings(model=model_name)
+        # 向量模型通过 provider 工厂创建，也支持外部传入自定义 embeddings。
+        self.embedding_provider = embedding_provider
+        self.embedding_model_name = embedding_model_name or model_name
+        self.embedding_model_kwargs = dict(embedding_model_kwargs or {})
+        self.embedding_config_hash = model_config_fingerprint(
+            self.embedding_provider,
+            self.embedding_model_name,
+            self.embedding_model_kwargs,
+        )
+        self.embeddings = embeddings or create_embeddings(
+            provider=self.embedding_provider,
+            model_name=self.embedding_model_name,
+            **self.embedding_model_kwargs,
+        )
 
-        # 重排序模型默认使用多语言 reranker，首次调用时再懒加载。
+        # 重排序模型按 provider 懒加载，避免只做入库时也初始化 reranker。
+        self.reranker_provider = reranker_provider
         self.reranker_model_name = reranker_model_name
+        self.reranker_model_kwargs = dict(reranker_model_kwargs or {})
         self.reranker = reranker
         self.reranker_device = reranker_device
         self.reranker_batch_size = reranker_batch_size
@@ -143,12 +169,15 @@ class RAGService:
         self.documents = self._load_documents_manifest()
         self.records = self._load_records()
         documents_changed = self._reconcile_documents_manifest()
+        embedding_metadata_changed = self._refresh_embedding_metadata()
         self.bm25: BM25Plus | None = None
         self.vector_rows = self._build_vector_rows()
-        self.index = self._load_or_create_index()
+        self.index = self._load_or_create_index(
+            force_rebuild=embedding_metadata_changed
+        )
         self._rebuild_bm25()
-        if documents_changed:
-            self._persist_documents_manifest()
+        if documents_changed or embedding_metadata_changed:
+            self._persist()
 
     def add_documents(
         self,
@@ -652,6 +681,7 @@ class RAGService:
             "rag.rerank",
             {
                 "query": query,
+                "reranker_provider": self.reranker_provider,
                 "reranker_model_name": self.reranker_model_name,
                 "candidate_count": len(candidates),
                 "top_k": top_k,
@@ -798,6 +828,9 @@ class RAGService:
             "chunking_strategy": CHUNKING_STRATEGY,
             "embedding_strategy": MULTI_VECTOR_STRATEGY,
             "embedding_types": list(MULTI_VECTOR_TYPES),
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model_name,
+            "embedding_config_hash": self.embedding_config_hash,
             "indexed_at": indexed_at,
             "version": 1,
         }
@@ -846,6 +879,9 @@ class RAGService:
                 "chunking_strategy": CHUNKING_STRATEGY,
                 "embedding_strategy": MULTI_VECTOR_STRATEGY,
                 "embedding_types": list(MULTI_VECTOR_TYPES),
+                "embedding_provider": self.embedding_provider,
+                "embedding_model": self.embedding_model_name,
+                "embedding_config_hash": self.embedding_config_hash,
             },
         }
 
@@ -869,6 +905,10 @@ class RAGService:
             == parent_chunk_overlap
             and existing_info.get("chunking_strategy") == CHUNKING_STRATEGY
             and existing_info.get("embedding_strategy") == MULTI_VECTOR_STRATEGY
+            and existing_info.get("embedding_provider") == self.embedding_provider
+            and existing_info.get("embedding_model") == self.embedding_model_name
+            and existing_info.get("embedding_config_hash")
+            == self.embedding_config_hash
         )
 
     def _remove_document_records(self, doc_id: str) -> int:
@@ -955,6 +995,37 @@ class RAGService:
             normalized[vector_type] = text or defaults[vector_type]
         return normalized
 
+    def _refresh_embedding_metadata(self) -> bool:
+        changed = False
+        for document_info in self.documents.values():
+            if document_info.get("embedding_provider") != self.embedding_provider:
+                document_info["embedding_provider"] = self.embedding_provider
+                changed = True
+            if document_info.get("embedding_model") != self.embedding_model_name:
+                document_info["embedding_model"] = self.embedding_model_name
+                changed = True
+            if (
+                document_info.get("embedding_config_hash")
+                != self.embedding_config_hash
+            ):
+                document_info["embedding_config_hash"] = self.embedding_config_hash
+                changed = True
+
+        for record in self.records:
+            metadata = record.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                record["metadata"] = metadata
+            for key, value in {
+                "embedding_provider": self.embedding_provider,
+                "embedding_model": self.embedding_model_name,
+                "embedding_config_hash": self.embedding_config_hash,
+            }.items():
+                if metadata.get(key) != value:
+                    metadata[key] = value
+                    changed = True
+        return changed
+
     def _build_vector_rows(self) -> list[dict]:
         rows: list[dict] = []
         for record_index, record in enumerate(self.records):
@@ -1036,7 +1107,9 @@ class RAGService:
         faiss.normalize_L2(matrix)
         return matrix
 
-    def _load_or_create_index(self) -> faiss.Index:
+    def _load_or_create_index(self, *, force_rebuild: bool = False) -> faiss.Index:
+        if force_rebuild:
+            return self._rebuild_and_persist_vector_index()
         if self.index_path.exists():
             index = faiss.read_index(str(self.index_path))
             if index.ntotal == len(self.vector_rows):
@@ -1304,12 +1377,12 @@ class RAGService:
             )
 
     def _get_reranker(self) -> Any:
-        # 懒加载 reranker，避免只做入库时也下载和初始化 Cross-Encoder。
         if self.reranker is None:
-            self.reranker = CrossEncoder(
-                self.reranker_model_name,
+            self.reranker = create_reranker(
+                provider=self.reranker_provider,
+                model_name=self.reranker_model_name,
                 device=self.reranker_device,
-                trust_remote_code=True,
+                **self.reranker_model_kwargs,
             )
         return self.reranker
 
@@ -1448,6 +1521,15 @@ class RAGService:
                 metadata.get("embedding_strategy") or MULTI_VECTOR_STRATEGY
             )
             merged_metadata["embedding_types"] = list(MULTI_VECTOR_TYPES)
+            merged_metadata["embedding_provider"] = str(
+                metadata.get("embedding_provider") or ""
+            )
+            merged_metadata["embedding_model"] = str(
+                metadata.get("embedding_model") or ""
+            )
+            merged_metadata["embedding_config_hash"] = str(
+                metadata.get("embedding_config_hash") or ""
+            )
 
             embedding_texts = self._normalize_embedding_texts(
                 raw_record.get("embedding_texts"),
@@ -1539,6 +1621,9 @@ class RAGService:
                 "chunking_strategy": record_strategy or "legacy_flat",
                 "embedding_strategy": MULTI_VECTOR_STRATEGY,
                 "embedding_types": list(MULTI_VECTOR_TYPES),
+                "embedding_provider": self.embedding_provider,
+                "embedding_model": self.embedding_model_name,
+                "embedding_config_hash": self.embedding_config_hash,
                 "indexed_at": _utc_now(),
                 "version": 1,
             }

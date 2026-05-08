@@ -7,7 +7,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-DEFAULT_AGENT_MODEL = "qwen3-max-2026-01-23"
+from .model_factory import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_CHAT_PROVIDER,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+    DEFAULT_RERANKER_MODEL,
+    DEFAULT_RERANKER_PROVIDER,
+)
+
+DEFAULT_AGENT_MODEL = DEFAULT_CHAT_MODEL
 DEFAULT_USER_ID = "default_user"
 DEFAULT_QUERY_REWRITE_MODE = "on"
 QUERY_REWRITE_MODES = ("on", "off", "rewrite_only", "multi_query")
@@ -19,6 +28,7 @@ DEFAULT_MEMORY_DIR = "memory"
 DEFAULT_TRACE_DIR = "traces"
 DEFAULT_MCP_CONFIG_PATH = "mcp_servers.json"
 DEFAULT_LIVE_EVENTS_ENABLED = True
+DEFAULT_CLI_CONFIG_OUTPUT_ENABLED = True
 
 
 class ConfigError(ValueError):
@@ -35,7 +45,9 @@ class PathSettings:
 
 @dataclass(frozen=True)
 class AgentSettings:
+    provider: str = DEFAULT_CHAT_PROVIDER
     model: str = DEFAULT_AGENT_MODEL
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
     user_id: str = DEFAULT_USER_ID
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
     max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS
@@ -47,12 +59,24 @@ class RetrievalSettings:
     query_rewrite: str = DEFAULT_QUERY_REWRITE_MODE
     bm25: bool = True
     cross_encoder: bool = False
+    embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_kwargs: dict[str, Any] = field(default_factory=dict)
+    reranker_provider: str = DEFAULT_RERANKER_PROVIDER
+    reranker_model: str = DEFAULT_RERANKER_MODEL
+    reranker_kwargs: dict[str, Any] = field(default_factory=dict)
+    reranker_device: str | None = None
+    reranker_batch_size: int = 16
 
 
 @dataclass(frozen=True)
 class LLMSettings:
+    rewrite_provider: str | None = None
     rewrite_model: str | None = None
+    rewrite_kwargs: dict[str, Any] = field(default_factory=dict)
+    memory_provider: str | None = None
     memory_model: str | None = None
+    memory_kwargs: dict[str, Any] = field(default_factory=dict)
     retry_attempts: int = 3
     timeout_s: float | None = 30.0
     retry_backoff_s: float = 1.0
@@ -82,6 +106,11 @@ class TraceSettings:
 
 
 @dataclass(frozen=True)
+class CLISettings:
+    show_config: bool = DEFAULT_CLI_CONFIG_OUTPUT_ENABLED
+
+
+@dataclass(frozen=True)
 class AppConfig:
     paths: PathSettings = field(default_factory=PathSettings)
     agent: AgentSettings = field(default_factory=AgentSettings)
@@ -91,6 +120,7 @@ class AppConfig:
     skills: SkillsSettings = field(default_factory=SkillsSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
+    cli: CLISettings = field(default_factory=CLISettings)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> AppConfig:
@@ -104,6 +134,7 @@ class AppConfig:
         skills = _skills_settings(raw.get("skills", {}))
         mcp = _mcp_settings(raw.get("mcp", {}))
         trace = _trace_settings(raw.get("trace", {}))
+        cli = _cli_settings(raw.get("cli", {}))
         return cls(
             paths=paths,
             agent=agent,
@@ -113,22 +144,53 @@ class AppConfig:
             skills=skills,
             mcp=mcp,
             trace=trace,
+            cli=cli,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def to_runtime_kwargs(self) -> dict[str, Any]:
+        rewrite_provider = self.llm.rewrite_provider or self.agent.provider
         rewrite_model = self.llm.rewrite_model or self.agent.model
+        rewrite_kwargs = (
+            self.agent.model_kwargs
+            if (
+                self.llm.rewrite_provider is None
+                and not self.llm.rewrite_kwargs
+            )
+            else self.llm.rewrite_kwargs
+        )
+        memory_provider = self.llm.memory_provider or self.agent.provider
         memory_model = self.llm.memory_model or self.agent.model
+        memory_kwargs = (
+            self.agent.model_kwargs
+            if (
+                self.llm.memory_provider is None
+                and not self.llm.memory_kwargs
+            )
+            else self.llm.memory_kwargs
+        )
         return {
             "query_rewrite_mode": self.retrieval.query_rewrite,
+            "rewrite_provider": rewrite_provider,
             "rewrite_model_name": rewrite_model,
+            "rewrite_model_kwargs": dict(rewrite_kwargs),
             "bm25_enabled": self.retrieval.bm25,
             "cross_encoder_enabled": self.retrieval.cross_encoder,
+            "embedding_provider": self.retrieval.embedding_provider,
+            "embedding_model_name": self.retrieval.embedding_model,
+            "embedding_model_kwargs": dict(self.retrieval.embedding_kwargs),
+            "reranker_provider": self.retrieval.reranker_provider,
+            "reranker_model_name": self.retrieval.reranker_model,
+            "reranker_model_kwargs": dict(self.retrieval.reranker_kwargs),
+            "reranker_device": self.retrieval.reranker_device,
+            "reranker_batch_size": self.retrieval.reranker_batch_size,
             "user_id": self.agent.user_id,
             "memory_enabled": self.memory.enabled,
+            "memory_provider": memory_provider,
             "memory_model_name": memory_model,
+            "memory_model_kwargs": dict(memory_kwargs),
             "memory_top_k": self.memory.top_k,
             "skills_enabled": self.skills.enabled,
             "skill_dirs": self.skills.dirs or None,
@@ -137,6 +199,7 @@ class AppConfig:
             "trace_enabled": self.trace.enabled,
             "live_events_enabled": self.trace.live,
             "trace_dir": self.paths.trace_dir,
+            "show_config": self.cli.show_config,
             "llm_retry_attempts": self.llm.retry_attempts,
             "llm_timeout_s": self.llm.timeout_s,
             "llm_retry_backoff_s": self.llm.retry_backoff_s,
@@ -145,7 +208,9 @@ class AppConfig:
             "reflection_enabled": self.agent.reflection_enabled,
             "data_dir": self.paths.data_dir,
             "memory_dir": self.paths.memory_dir,
+            "agent_provider": self.agent.provider,
             "agent_model_name": self.agent.model,
+            "agent_model_kwargs": dict(self.agent.model_kwargs),
         }
 
 
@@ -205,7 +270,12 @@ def build_env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
         "RAG_SERVER_MEMORY_DIR": ("paths", "memory_dir"),
         "RAG_SERVER_TRACE_DIR": ("paths", "trace_dir"),
         "RAG_SERVER_MCP_CONFIG": ("paths", "mcp_config_path"),
+        "RAG_SERVER_AGENT_PROVIDER": ("agent", "provider"),
+        "RAG_SERVER_CHAT_PROVIDER": ("agent", "provider"),
         "RAG_SERVER_AGENT_MODEL": ("agent", "model"),
+        "RAG_SERVER_CHAT_MODEL": ("agent", "model"),
+        "RAG_SERVER_AGENT_MODEL_KWARGS": ("agent", "model_kwargs"),
+        "RAG_SERVER_CHAT_MODEL_KWARGS": ("agent", "model_kwargs"),
         "RAG_SERVER_USER_ID": ("agent", "user_id"),
         "RAG_SERVER_MAX_TOOL_ROUNDS": ("agent", "max_tool_rounds"),
         "RAG_SERVER_MAX_REPEATED_TOOL_CALLS": (
@@ -216,8 +286,34 @@ def build_env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
         "RAG_SERVER_QUERY_REWRITE": ("retrieval", "query_rewrite"),
         "RAG_SERVER_BM25": ("retrieval", "bm25"),
         "RAG_SERVER_CROSS_ENCODER": ("retrieval", "cross_encoder"),
+        "RAG_SERVER_EMBEDDING_PROVIDER": ("retrieval", "embedding_provider"),
+        "RAG_SERVER_EMBEDDING_MODEL": ("retrieval", "embedding_model"),
+        "RAG_SERVER_EMBEDDING_KWARGS": ("retrieval", "embedding_kwargs"),
+        "RAG_SERVER_EMBEDDING_MODEL_KWARGS": ("retrieval", "embedding_kwargs"),
+        "RAG_SERVER_RERANKER_PROVIDER": ("retrieval", "reranker_provider"),
+        "RAG_SERVER_RERANKER_MODEL": ("retrieval", "reranker_model"),
+        "RAG_SERVER_RERANKER_KWARGS": ("retrieval", "reranker_kwargs"),
+        "RAG_SERVER_RERANKER_MODEL_KWARGS": ("retrieval", "reranker_kwargs"),
+        "RAG_SERVER_RERANKER_DEVICE": ("retrieval", "reranker_device"),
+        "RAG_SERVER_RERANKER_BATCH_SIZE": ("retrieval", "reranker_batch_size"),
+        "RAG_SERVER_RERANK_PROVIDER": ("retrieval", "reranker_provider"),
+        "RAG_SERVER_RERANK_MODEL": ("retrieval", "reranker_model"),
+        "RAG_SERVER_RERANK_KWARGS": ("retrieval", "reranker_kwargs"),
+        "RAG_SERVER_RERANK_MODEL_KWARGS": ("retrieval", "reranker_kwargs"),
+        "RAG_SERVER_RERANK_DEVICE": ("retrieval", "reranker_device"),
+        "RAG_SERVER_RERANK_BATCH_SIZE": ("retrieval", "reranker_batch_size"),
+        "RAG_SERVER_QUERY_REWRITE_PROVIDER": ("llm", "rewrite_provider"),
+        "RAG_SERVER_QUERY_REWRITE_MODEL": ("llm", "rewrite_model"),
+        "RAG_SERVER_QUERY_REWRITE_KWARGS": ("llm", "rewrite_kwargs"),
+        "RAG_SERVER_QUERY_REWRITE_MODEL_KWARGS": ("llm", "rewrite_kwargs"),
+        "RAG_SERVER_REWRITE_PROVIDER": ("llm", "rewrite_provider"),
         "RAG_SERVER_REWRITE_MODEL": ("llm", "rewrite_model"),
+        "RAG_SERVER_REWRITE_KWARGS": ("llm", "rewrite_kwargs"),
+        "RAG_SERVER_REWRITE_MODEL_KWARGS": ("llm", "rewrite_kwargs"),
+        "RAG_SERVER_MEMORY_PROVIDER": ("llm", "memory_provider"),
         "RAG_SERVER_MEMORY_MODEL": ("llm", "memory_model"),
+        "RAG_SERVER_MEMORY_KWARGS": ("llm", "memory_kwargs"),
+        "RAG_SERVER_MEMORY_MODEL_KWARGS": ("llm", "memory_kwargs"),
         "RAG_SERVER_LLM_RETRY_ATTEMPTS": ("llm", "retry_attempts"),
         "RAG_SERVER_LLM_TIMEOUT": ("llm", "timeout_s"),
         "RAG_SERVER_LLM_RETRY_BACKOFF": ("llm", "retry_backoff_s"),
@@ -228,6 +324,12 @@ def build_env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
         "RAG_SERVER_MCP": ("mcp", "enabled"),
         "RAG_SERVER_TRACE": ("trace", "enabled"),
         "RAG_SERVER_LIVE_EVENTS": ("trace", "live"),
+        "RAG_SERVER_LIVE_LOGS": ("trace", "live"),
+        "RAG_SERVER_CLI_LIVE_EVENTS": ("trace", "live"),
+        "RAG_SERVER_CLI_LIVE_LOGS": ("trace", "live"),
+        "RAG_SERVER_SHOW_CONFIG": ("cli", "show_config"),
+        "RAG_SERVER_CLI_SHOW_CONFIG": ("cli", "show_config"),
+        "RAG_SERVER_CLI_CONFIG_OUTPUT": ("cli", "show_config"),
     }
 
     result: dict[str, Any] = {}
@@ -270,7 +372,9 @@ def _agent_settings(raw: Any) -> AgentSettings:
         "agent",
         section,
         {
+            "provider",
             "model",
+            "model_kwargs",
             "user_id",
             "max_tool_rounds",
             "max_repeated_tool_calls",
@@ -279,7 +383,15 @@ def _agent_settings(raw: Any) -> AgentSettings:
     )
     default = AgentSettings()
     return AgentSettings(
+        provider=_non_empty_str(
+            section.get("provider", default.provider),
+            "agent.provider",
+        ),
         model=_non_empty_str(section.get("model", default.model), "agent.model"),
+        model_kwargs=_coerce_mapping(
+            section.get("model_kwargs", default.model_kwargs),
+            "agent.model_kwargs",
+        ),
         user_id=_non_empty_str(section.get("user_id", default.user_id), "agent.user_id"),
         max_tool_rounds=_coerce_int(
             section.get("max_tool_rounds", default.max_tool_rounds),
@@ -303,7 +415,23 @@ def _agent_settings(raw: Any) -> AgentSettings:
 
 def _retrieval_settings(raw: Any) -> RetrievalSettings:
     section = _section(raw, "retrieval")
-    _ensure_known_keys("retrieval", section, {"query_rewrite", "bm25", "cross_encoder"})
+    _ensure_known_keys(
+        "retrieval",
+        section,
+        {
+            "query_rewrite",
+            "bm25",
+            "cross_encoder",
+            "embedding_provider",
+            "embedding_model",
+            "embedding_kwargs",
+            "reranker_provider",
+            "reranker_model",
+            "reranker_kwargs",
+            "reranker_device",
+            "reranker_batch_size",
+        },
+    )
     default = RetrievalSettings()
     query_rewrite = _non_empty_str(
         section.get("query_rewrite", default.query_rewrite),
@@ -319,6 +447,38 @@ def _retrieval_settings(raw: Any) -> RetrievalSettings:
             section.get("cross_encoder", default.cross_encoder),
             "retrieval.cross_encoder",
         ),
+        embedding_provider=_non_empty_str(
+            section.get("embedding_provider", default.embedding_provider),
+            "retrieval.embedding_provider",
+        ),
+        embedding_model=_non_empty_str(
+            section.get("embedding_model", default.embedding_model),
+            "retrieval.embedding_model",
+        ),
+        embedding_kwargs=_coerce_mapping(
+            section.get("embedding_kwargs", default.embedding_kwargs),
+            "retrieval.embedding_kwargs",
+        ),
+        reranker_provider=_non_empty_str(
+            section.get("reranker_provider", default.reranker_provider),
+            "retrieval.reranker_provider",
+        ),
+        reranker_model=_non_empty_str(
+            section.get("reranker_model", default.reranker_model),
+            "retrieval.reranker_model",
+        ),
+        reranker_kwargs=_coerce_mapping(
+            section.get("reranker_kwargs", default.reranker_kwargs),
+            "retrieval.reranker_kwargs",
+        ),
+        reranker_device=_optional_str(
+            section.get("reranker_device", default.reranker_device)
+        ),
+        reranker_batch_size=_coerce_int(
+            section.get("reranker_batch_size", default.reranker_batch_size),
+            "retrieval.reranker_batch_size",
+            minimum=1,
+        ),
     )
 
 
@@ -328,8 +488,12 @@ def _llm_settings(raw: Any) -> LLMSettings:
         "llm",
         section,
         {
+            "rewrite_provider",
             "rewrite_model",
+            "rewrite_kwargs",
+            "memory_provider",
             "memory_model",
+            "memory_kwargs",
             "retry_attempts",
             "timeout_s",
             "retry_backoff_s",
@@ -337,8 +501,22 @@ def _llm_settings(raw: Any) -> LLMSettings:
     )
     default = LLMSettings()
     return LLMSettings(
+        rewrite_provider=_optional_str(
+            section.get("rewrite_provider", default.rewrite_provider)
+        ),
         rewrite_model=_optional_str(section.get("rewrite_model", default.rewrite_model)),
+        rewrite_kwargs=_coerce_mapping(
+            section.get("rewrite_kwargs", default.rewrite_kwargs),
+            "llm.rewrite_kwargs",
+        ),
+        memory_provider=_optional_str(
+            section.get("memory_provider", default.memory_provider)
+        ),
         memory_model=_optional_str(section.get("memory_model", default.memory_model)),
+        memory_kwargs=_coerce_mapping(
+            section.get("memory_kwargs", default.memory_kwargs),
+            "llm.memory_kwargs",
+        ),
         retry_attempts=_coerce_int(
             section.get("retry_attempts", default.retry_attempts),
             "llm.retry_attempts",
@@ -395,18 +573,53 @@ def _trace_settings(raw: Any) -> TraceSettings:
     )
 
 
+def _cli_settings(raw: Any) -> CLISettings:
+    section = _section(raw, "cli")
+    _ensure_known_keys("cli", section, {"show_config"})
+    default = CLISettings()
+    return CLISettings(
+        show_config=_coerce_bool(
+            section.get("show_config", default.show_config),
+            "cli.show_config",
+        ),
+    )
+
+
 def _normalize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     aliases = {
         ("paths", "mcp_config"): ("paths", "mcp_config_path"),
+        ("agent", "chat_provider"): ("agent", "provider"),
+        ("agent", "chat_model"): ("agent", "model"),
+        ("agent", "chat_model_kwargs"): ("agent", "model_kwargs"),
         ("agent", "reflection"): ("agent", "reflection_enabled"),
         ("retrieval", "query_rewrite_mode"): ("retrieval", "query_rewrite"),
         ("retrieval", "bm25_enabled"): ("retrieval", "bm25"),
         ("retrieval", "cross_encoder_enabled"): ("retrieval", "cross_encoder"),
+        ("retrieval", "embedding_model_name"): ("retrieval", "embedding_model"),
+        ("retrieval", "embedding_model_kwargs"): ("retrieval", "embedding_kwargs"),
+        ("retrieval", "rerank_provider"): ("retrieval", "reranker_provider"),
+        ("retrieval", "reranker_model_name"): ("retrieval", "reranker_model"),
+        ("retrieval", "rerank_model"): ("retrieval", "reranker_model"),
+        ("retrieval", "rerank_model_name"): ("retrieval", "reranker_model"),
+        ("retrieval", "reranker_model_kwargs"): ("retrieval", "reranker_kwargs"),
+        ("retrieval", "rerank_kwargs"): ("retrieval", "reranker_kwargs"),
+        ("retrieval", "rerank_model_kwargs"): ("retrieval", "reranker_kwargs"),
+        ("retrieval", "rerank_device"): ("retrieval", "reranker_device"),
+        ("retrieval", "rerank_batch_size"): ("retrieval", "reranker_batch_size"),
+        ("llm", "query_rewrite_provider"): ("llm", "rewrite_provider"),
+        ("llm", "query_rewrite_model"): ("llm", "rewrite_model"),
+        ("llm", "query_rewrite_kwargs"): ("llm", "rewrite_kwargs"),
         ("llm", "llm_retry_attempts"): ("llm", "retry_attempts"),
         ("llm", "llm_timeout_s"): ("llm", "timeout_s"),
         ("llm", "llm_retry_backoff_s"): ("llm", "retry_backoff_s"),
         ("memory", "memory_top_k"): ("memory", "top_k"),
         ("trace", "live_events"): ("trace", "live"),
+        ("trace", "live_logs"): ("trace", "live"),
+        ("cli", "startup_config"): ("cli", "show_config"),
+        ("cli", "show_startup_config"): ("cli", "show_config"),
+        ("cli", "config_output"): ("cli", "show_config"),
+        ("cli", "live_events"): ("trace", "live"),
+        ("cli", "live_logs"): ("trace", "live"),
     }
     normalized: dict[str, Any] = {}
     for section_name, raw_section in value.items():
@@ -423,7 +636,11 @@ def _normalize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
                 normalized.setdefault(target_section, {})[target_key] = item
             else:
                 normalized_section[target_key] = item
-        normalized[str(section_name)] = normalized_section
+        existing = normalized.get(str(section_name))
+        if isinstance(existing, Mapping):
+            normalized[str(section_name)] = _deep_merge(existing, normalized_section)
+        else:
+            normalized[str(section_name)] = normalized_section
     return normalized
 
 
@@ -450,7 +667,17 @@ def _section(raw: Any, name: str) -> dict[str, Any]:
 
 
 def _ensure_known_sections(raw: Mapping[str, Any]) -> None:
-    allowed = {"paths", "agent", "retrieval", "llm", "memory", "skills", "mcp", "trace"}
+    allowed = {
+        "paths",
+        "agent",
+        "retrieval",
+        "llm",
+        "memory",
+        "skills",
+        "mcp",
+        "trace",
+        "cli",
+    }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ConfigError(f"Unknown config section(s): {', '.join(unknown)}")
@@ -528,3 +755,19 @@ def _coerce_str_list(value: Any, field_name: str) -> list[str]:
     else:
         raise ConfigError(f"{field_name} must be a list of strings")
     return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _coerce_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise ConfigError(f"{field_name} must be a JSON object") from error
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{field_name} must be an object")
+    return {str(key): item for key, item in value.items()}

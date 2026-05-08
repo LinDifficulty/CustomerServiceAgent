@@ -13,7 +13,10 @@
       "parent_chunk_overlap": 0,
       "chunking_strategy": "legacy_flat",
       "indexed_at": "2026-05-08T09:57:36.267012+00:00",
-      "version": 1
+      "version": 1,
+      "embedding_provider": "dashscope",
+      "embedding_model": "text-embedding-v4",
+      "embedding_config_hash": "2063eccf46c0fbae655bd4ec13acf553accdc28fdb34ff79a06354510c320cf3"
     },
     "1d50994dd3b4b42d0204b6d2": {
       "doc_id": "1d50994dd3b4b42d0204b6d2",
@@ -27,7 +30,10 @@
       "parent_chunk_overlap": 0,
       "chunking_strategy": "legacy_flat",
       "indexed_at": "2026-05-08T09:57:36.267023+00:00",
-      "version": 1
+      "version": 1,
+      "embedding_provider": "dashscope",
+      "embedding_model": "text-embedding-v4",
+      "embedding_config_hash": "2063eccf46c0fbae655bd4ec13acf553accdc28fdb34ff79a06354510c320cf3"
     },
     "715b3b9fe919104b7034af0b": {
       "doc_id": "715b3b9fe919104b7034af0b",
@@ -41,7 +47,10 @@
       "parent_chunk_overlap": 0,
       "chunking_strategy": "legacy_flat",
       "indexed_at": "2026-05-08T09:57:36.267026+00:00",
-      "version": 1
+      "version": 1,
+      "embedding_provider": "dashscope",
+      "embedding_model": "text-embedding-v4",
+      "embedding_config_hash": "2063eccf46c0fbae655bd4ec13acf553accdc28fdb34ff79a06354510c320cf3"
     },
     "7e71355bc1713eb93a0e9899": {
       "doc_id": "7e71355bc1713eb93a0e9899",
@@ -55,7 +64,10 @@
       "parent_chunk_overlap": 0,
       "chunking_strategy": "legacy_flat",
       "indexed_at": "2026-05-08T09:57:36.267028+00:00",
-      "version": 1
+      "version": 1,
+      "embedding_provider": "dashscope",
+      "embedding_model": "text-embedding-v4",
+      "embedding_config_hash": "2063eccf46c0fbae655bd4ec13acf553accdc28fdb34ff79a06354510c320cf3"
     }
   }
 }

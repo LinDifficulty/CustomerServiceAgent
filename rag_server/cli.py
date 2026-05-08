@@ -15,14 +15,27 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.tools import BaseTool, tool
-from langchain_community.chat_models import ChatTongyi
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from .config import DEFAULT_LIVE_EVENTS_ENABLED, ConfigError, load_app_config
+from .config import (
+    DEFAULT_CLI_CONFIG_OUTPUT_ENABLED,
+    DEFAULT_LIVE_EVENTS_ENABLED,
+    ConfigError,
+    load_app_config,
+)
 from .llm_retry import LLMRetryError, LLMRetryPolicy, ainvoke_with_retry
 from .memory_service import LLMMemoryExtractor, MemoryService
 from .mcp_service import DEFAULT_MCP_CONFIG_PATH, load_mcp_tools_from_config
+from .model_factory import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_CHAT_PROVIDER,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+    DEFAULT_RERANKER_MODEL,
+    DEFAULT_RERANKER_PROVIDER,
+    create_chat_model,
+)
 from .query_rewrite import LLMQueryRewriter, search_with_query_rewrites
 from .rag_service import RAGService
 from .reflection_service import ReflectionAgent
@@ -30,7 +43,7 @@ from .skill_service import SkillRegistry, build_skill_tools
 from .trace_service import DEFAULT_TRACE_DIR, TraceRecorder, preview_text
 from .utils import coerce_message_content
 
-DEFAULT_AGENT_MODEL = "qwen3-max-2026-01-23"
+DEFAULT_AGENT_MODEL = DEFAULT_CHAT_MODEL
 DEFAULT_USER_ID = "default_user"
 DEFAULT_QUERY_REWRITE_MODE = "on"
 QUERY_REWRITE_MODES = ("on", "off", "rewrite_only", "multi_query")
@@ -57,11 +70,11 @@ def normalize_query_rewrite_mode(mode: str) -> str:
 
 
 def format_tongyi_error(
-    model: ChatTongyi,
+    model: Any,
     messages: list[BaseMessage],
     error: Exception,
 ) -> str:
-    """把 Tongyi 的异常转换成更可读的 CLI 错误信息。"""
+    """把模型异常转换成更可读的 CLI 错误信息。"""
     if isinstance(error, LLMRetryError):
         prefix = (
             "大模型多次尝试后仍未及时响应或暂时不可用。"
@@ -91,14 +104,18 @@ def build_retrieval_tool(
     rag: RAGService,
     *,
     query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
+    rewrite_provider: str = DEFAULT_CHAT_PROVIDER,
     rewrite_model_name: str = DEFAULT_AGENT_MODEL,
+    rewrite_model_kwargs: dict[str, Any] | None = None,
     llm_retry_policy: LLMRetryPolicy | None = None,
     trace_recorder: TraceRecorder | None = None,
 ):
     actual_mode = normalize_query_rewrite_mode(query_rewrite_mode)
     rewriter = (
         LLMQueryRewriter(
+            provider=rewrite_provider,
             model_name=rewrite_model_name,
+            model_kwargs=rewrite_model_kwargs,
             trace_recorder=trace_recorder,
             retry_policy=llm_retry_policy,
         )
@@ -715,8 +732,12 @@ def build_agent(
     rag: RAGService,
     *,
     query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
+    agent_provider: str = DEFAULT_CHAT_PROVIDER,
     agent_model_name: str = DEFAULT_AGENT_MODEL,
+    agent_model_kwargs: dict[str, Any] | None = None,
+    rewrite_provider: str = DEFAULT_CHAT_PROVIDER,
     rewrite_model_name: str = DEFAULT_AGENT_MODEL,
+    rewrite_model_kwargs: dict[str, Any] | None = None,
     memory_service: MemoryService | None = None,
     memory_extractor: LLMMemoryExtractor | None = None,
     memory_top_k: int = 5,
@@ -737,7 +758,9 @@ def build_agent(
     rewriter = None
     if actual_query_rewrite_mode != "off":
         rewriter = LLMQueryRewriter(
+            provider=rewrite_provider,
             model_name=rewrite_model_name,
+            model_kwargs=rewrite_model_kwargs,
             trace_recorder=trace_recorder,
             retry_policy=retry_policy,
         )
@@ -767,12 +790,18 @@ def build_agent(
             return "mcp"
         return "tool"
 
-    base_model = agent_model or ChatTongyi(model=agent_model_name, max_retries=0)
+    base_model = agent_model or create_chat_model(
+        provider=agent_provider,
+        model_name=agent_model_name,
+        **(agent_model_kwargs or {}),
+    )
     model = base_model.bind_tools(tools)
     reflection_agent = (
         ReflectionAgent(
             rag=rag,
+            provider=agent_provider,
             model_name=agent_model_name,
+            model_kwargs=agent_model_kwargs,
             model=base_model,
             retry_policy=retry_policy,
             trace_recorder=trace_recorder,
@@ -1259,13 +1288,27 @@ def build_agent(
 async def run_cli_async(
     *,
     query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
+    agent_provider: str = DEFAULT_CHAT_PROVIDER,
     agent_model_name: str = DEFAULT_AGENT_MODEL,
+    agent_model_kwargs: dict[str, Any] | None = None,
+    rewrite_provider: str = DEFAULT_CHAT_PROVIDER,
     rewrite_model_name: str = DEFAULT_AGENT_MODEL,
+    rewrite_model_kwargs: dict[str, Any] | None = None,
+    embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER,
+    embedding_model_name: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_model_kwargs: dict[str, Any] | None = None,
+    reranker_provider: str = DEFAULT_RERANKER_PROVIDER,
+    reranker_model_name: str = DEFAULT_RERANKER_MODEL,
+    reranker_model_kwargs: dict[str, Any] | None = None,
+    reranker_device: str | None = None,
+    reranker_batch_size: int = 16,
     bm25_enabled: bool = True,
     cross_encoder_enabled: bool = False,
     user_id: str = DEFAULT_USER_ID,
     memory_enabled: bool = True,
+    memory_provider: str = DEFAULT_CHAT_PROVIDER,
     memory_model_name: str = DEFAULT_AGENT_MODEL,
+    memory_model_kwargs: dict[str, Any] | None = None,
     memory_top_k: int = 5,
     skills_enabled: bool = True,
     skill_dirs: list[str] | None = None,
@@ -1273,6 +1316,7 @@ async def run_cli_async(
     mcp_config_path: str = DEFAULT_MCP_CONFIG_PATH,
     trace_enabled: bool = False,
     live_events_enabled: bool = DEFAULT_LIVE_EVENTS_ENABLED,
+    show_config: bool = DEFAULT_CLI_CONFIG_OUTPUT_ENABLED,
     trace_dir: str = DEFAULT_TRACE_DIR,
     data_dir: str = "data",
     memory_dir: str = "memory",
@@ -1297,6 +1341,7 @@ async def run_cli_async(
             default_tags={
                 "entrypoint": "cli",
                 "user_id": user_id,
+                "agent_provider": agent_provider,
                 "agent_model": agent_model_name,
             },
             event_sinks=[
@@ -1309,11 +1354,20 @@ async def run_cli_async(
             "cli.startup",
             {
                 "query_rewrite_mode": actual_query_rewrite_mode,
+                "agent_provider": agent_provider,
                 "agent_model_name": agent_model_name,
+                "rewrite_provider": rewrite_provider,
                 "rewrite_model_name": rewrite_model_name,
                 "bm25_enabled": bm25_enabled,
                 "cross_encoder_enabled": cross_encoder_enabled,
+                "embedding_provider": embedding_provider,
+                "embedding_model_name": embedding_model_name,
+                "reranker_provider": reranker_provider,
+                "reranker_model_name": reranker_model_name,
+                "reranker_device": reranker_device,
+                "reranker_batch_size": reranker_batch_size,
                 "memory_enabled": memory_enabled,
+                "memory_provider": memory_provider,
                 "memory_model_name": memory_model_name,
                 "memory_top_k": memory_top_k,
                 "skills_enabled": skills_enabled,
@@ -1323,6 +1377,7 @@ async def run_cli_async(
                 "trace_dir": trace_dir,
                 "trace_enabled": trace_enabled,
                 "live_events_enabled": live_events_enabled,
+                "show_config": show_config,
                 "data_dir": data_dir,
                 "memory_dir": memory_dir,
                 "llm_retry_attempts": llm_retry_policy.normalized().max_attempts,
@@ -1337,18 +1392,34 @@ async def run_cli_async(
         )
     rag = RAGService(
         data_dir=data_dir,
+        embedding_provider=embedding_provider,
+        embedding_model_name=embedding_model_name,
+        embedding_model_kwargs=embedding_model_kwargs,
+        reranker_provider=reranker_provider,
+        reranker_model_name=reranker_model_name,
+        reranker_model_kwargs=reranker_model_kwargs,
+        reranker_device=reranker_device,
+        reranker_batch_size=reranker_batch_size,
         default_use_bm25=bm25_enabled,
         default_use_rerank=cross_encoder_enabled,
         trace_recorder=trace_recorder,
     )
     memory_service = (
-        MemoryService(data_dir=memory_dir, trace_recorder=trace_recorder)
+        MemoryService(
+            data_dir=memory_dir,
+            embedding_provider=embedding_provider,
+            embedding_model_name=embedding_model_name,
+            embedding_model_kwargs=embedding_model_kwargs,
+            trace_recorder=trace_recorder,
+        )
         if memory_enabled
         else None
     )
     memory_extractor = (
         LLMMemoryExtractor(
+            provider=memory_provider,
             model_name=memory_model_name,
+            model_kwargs=memory_model_kwargs,
             retry_policy=llm_retry_policy,
             trace_recorder=trace_recorder,
         )
@@ -1382,8 +1453,12 @@ async def run_cli_async(
     app, model, system_prompt = build_agent(
         rag,
         query_rewrite_mode=actual_query_rewrite_mode,
+        agent_provider=agent_provider,
         agent_model_name=agent_model_name,
+        agent_model_kwargs=agent_model_kwargs,
+        rewrite_provider=rewrite_provider,
         rewrite_model_name=rewrite_model_name,
+        rewrite_model_kwargs=rewrite_model_kwargs,
         memory_service=memory_service,
         memory_extractor=memory_extractor,
         memory_top_k=memory_top_k,
@@ -1399,50 +1474,58 @@ async def run_cli_async(
     messages: list[BaseMessage] = []
 
     print("电商客服 Agent 已启动，输入 quit 或 exit 结束。")
-    print(f"当前 Agent 模型: {agent_model_name}")
-    print(f"当前 query 改写模式: {actual_query_rewrite_mode}")
-    print(f"当前 BM25 模式: {'on' if bm25_enabled else 'off'}")
-    print(f"当前 CrossEncoder 精排模式: {'on' if cross_encoder_enabled else 'off'}")
-    print(f"当前 data_dir: {data_dir}")
-    print(f"当前 memory_dir: {memory_dir}")
-    print(f"当前 memory 模式: {'on' if memory_enabled else 'off'}")
-    print(
-        "当前 LLM 重试策略: "
-        f"attempts={llm_retry_policy.normalized().max_attempts}, "
-        f"timeout={llm_retry_policy.normalized().per_attempt_timeout_s}s, "
-        f"backoff={llm_retry_policy.normalized().initial_backoff_s}s"
-    )
-    print(
-        "当前工具循环保护: "
-        f"max_tool_rounds={max_tool_rounds}, "
-        f"max_repeated_tool_calls={max_repeated_tool_calls}"
-    )
-    print(f"当前 Reflection 模式: {'on' if reflection_enabled else 'off'}")
-    if trace_enabled and trace_recorder is not None:
-        print(f"当前 trace 模式: on ({trace_recorder.path})")
-    else:
-        print("当前 trace 模式: off")
-    print(f"当前 CLI 实时事件: {'on' if live_events_enabled else 'off'}")
-    if skill_registry is not None:
-        skills = skill_registry.list_skills()
-        print(f"当前 skills 模式: on ({len(skills)} 个)")
-        if skills:
-            print("可用 skills: " + ", ".join(skill.name for skill in skills))
-        if skill_registry.errors:
-            print("skills 加载警告:")
-            for error in skill_registry.errors:
-                print(f"- {error}")
-    else:
-        print("当前 skills 模式: off")
-    if mcp_result is not None:
-        server_names = ", ".join(mcp_result.server_names) or "无"
-        tool_names = ", ".join(tool.name for tool in mcp_tools) or "无"
-        print(f"当前 MCP 模式: on ({len(mcp_tools)} 个工具)")
-        print(f"MCP servers: {server_names}")
-        print(f"MCP tools: {tool_names}")
-    else:
-        print("当前 MCP 模式: off")
-    print(f"当前 user_id: {user_id}")
+    if show_config:
+        print(f"当前 Agent 模型: {agent_provider}:{agent_model_name}")
+        print(f"当前 Embedding 模型: {embedding_provider}:{embedding_model_name}")
+        print(f"当前 query 改写模式: {actual_query_rewrite_mode}")
+        if actual_query_rewrite_mode != "off":
+            print(f"当前 query 改写模型: {rewrite_provider}:{rewrite_model_name}")
+        print(f"当前 BM25 模式: {'on' if bm25_enabled else 'off'}")
+        print(f"当前 Rerank 模式: {'on' if cross_encoder_enabled else 'off'}")
+        if cross_encoder_enabled:
+            print(f"当前 Rerank 模型: {reranker_provider}:{reranker_model_name}")
+        print(f"当前 data_dir: {data_dir}")
+        print(f"当前 memory_dir: {memory_dir}")
+        print(f"当前 memory 模式: {'on' if memory_enabled else 'off'}")
+        if memory_enabled:
+            print(f"当前 memory 抽取模型: {memory_provider}:{memory_model_name}")
+        print(
+            "当前 LLM 重试策略: "
+            f"attempts={llm_retry_policy.normalized().max_attempts}, "
+            f"timeout={llm_retry_policy.normalized().per_attempt_timeout_s}s, "
+            f"backoff={llm_retry_policy.normalized().initial_backoff_s}s"
+        )
+        print(
+            "当前工具循环保护: "
+            f"max_tool_rounds={max_tool_rounds}, "
+            f"max_repeated_tool_calls={max_repeated_tool_calls}"
+        )
+        print(f"当前 Reflection 模式: {'on' if reflection_enabled else 'off'}")
+        if trace_enabled and trace_recorder is not None:
+            print(f"当前 trace 模式: on ({trace_recorder.path})")
+        else:
+            print("当前 trace 模式: off")
+        print(f"当前 CLI 实时事件: {'on' if live_events_enabled else 'off'}")
+        if skill_registry is not None:
+            skills = skill_registry.list_skills()
+            print(f"当前 skills 模式: on ({len(skills)} 个)")
+            if skills:
+                print("可用 skills: " + ", ".join(skill.name for skill in skills))
+            if skill_registry.errors:
+                print("skills 加载警告:")
+                for error in skill_registry.errors:
+                    print(f"- {error}")
+        else:
+            print("当前 skills 模式: off")
+        if mcp_result is not None:
+            server_names = ", ".join(mcp_result.server_names) or "无"
+            tool_names = ", ".join(tool.name for tool in mcp_tools) or "无"
+            print(f"当前 MCP 模式: on ({len(mcp_tools)} 个工具)")
+            print(f"MCP servers: {server_names}")
+            print(f"MCP tools: {tool_names}")
+        else:
+            print("当前 MCP 模式: off")
+        print(f"当前 user_id: {user_id}")
     try:
         while True:
             user_input = input("\n你: ").strip()
@@ -1479,7 +1562,10 @@ async def run_cli_async(
                     stream_mode="updates",
                 ):
                     for node_name, node_output in event.items():
-                        node_messages = node_output.get("messages", [])
+                        if not isinstance(node_output, dict):
+                            result = None
+                            continue
+                        node_messages = node_output.get("messages") or []
                         for msg in node_messages:
                             if not isinstance(msg, AIMessage):
                                 continue
@@ -1576,9 +1662,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Long-term memory data directory. Overrides config/env when set.",
     )
     parser.add_argument(
-        "--agent-model",
+        "--agent-provider",
+        "--chat-provider",
+        dest="agent_provider",
         default=None,
-        help="Model name used by the agent. Overrides config/env when set.",
+        help="Provider used by the agent chat model. Built-ins: tongyi, openai, or an import path.",
+    )
+    parser.add_argument(
+        "--agent-model",
+        "--chat-model",
+        dest="agent_model",
+        default=None,
+        help="Model name used by the agent chat model. Overrides config/env when set.",
+    )
+    parser.add_argument(
+        "--agent-model-kwargs",
+        "--chat-model-kwargs",
+        dest="agent_model_kwargs",
+        default=None,
+        help="JSON object passed to the agent chat model constructor.",
     )
     parser.add_argument(
         "--query-rewrite",
@@ -1602,9 +1704,70 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable or disable CrossEncoder reranking. Defaults to config value.",
     )
     parser.add_argument(
+        "--embedding-provider",
+        default=None,
+        help="Provider used by the embedding model. Built-ins: dashscope, openai, or an import path.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model name. Defaults to config value.",
+    )
+    parser.add_argument(
+        "--embedding-model-kwargs",
+        default=None,
+        help="JSON object passed to the embedding model constructor.",
+    )
+    parser.add_argument(
+        "--reranker-provider",
+        "--rerank-provider",
+        dest="reranker_provider",
+        default=None,
+        help="Provider used by reranking. Built-ins: cross_encoder or an import path.",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        "--rerank-model",
+        dest="reranker_model",
+        default=None,
+        help="Reranker model name. Defaults to config value.",
+    )
+    parser.add_argument(
+        "--reranker-model-kwargs",
+        "--rerank-model-kwargs",
+        dest="reranker_model_kwargs",
+        default=None,
+        help="JSON object passed to the reranker constructor.",
+    )
+    parser.add_argument(
+        "--reranker-device",
+        "--rerank-device",
+        dest="reranker_device",
+        default=None,
+        help="Optional device for reranker loading, such as cpu, cuda, or mps.",
+    )
+    parser.add_argument(
+        "--reranker-batch-size",
+        "--rerank-batch-size",
+        dest="reranker_batch_size",
+        type=int,
+        default=None,
+        help="Batch size used by reranker predict(). Defaults to config value.",
+    )
+    parser.add_argument(
+        "--rewrite-provider",
+        default=None,
+        help="Provider used by the query rewrite model. Defaults to the agent provider.",
+    )
+    parser.add_argument(
         "--rewrite-model",
         default=None,
         help="Model name used by the query rewriter. Defaults to the agent model.",
+    )
+    parser.add_argument(
+        "--rewrite-model-kwargs",
+        default=None,
+        help="JSON object passed to the query rewrite model constructor.",
     )
     parser.add_argument(
         "--user-id",
@@ -1618,9 +1781,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable or disable long-term memory. Defaults to config value.",
     )
     parser.add_argument(
+        "--memory-provider",
+        default=None,
+        help="Provider used by the memory extractor model. Defaults to the agent provider.",
+    )
+    parser.add_argument(
         "--memory-model",
         default=None,
         help="Model name used by the memory extractor. Defaults to the agent model.",
+    )
+    parser.add_argument(
+        "--memory-model-kwargs",
+        default=None,
+        help="JSON object passed to the memory extractor model constructor.",
     )
     parser.add_argument(
         "--memory-top-k",
@@ -1665,10 +1838,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--live-events",
+        "--live-logs",
+        dest="live_events",
         choices=["on", "off"],
         default=None,
         help=(
-            "Show RAG, memory, skill, and MCP events live in the CLI. "
+            "Show RAG, memory, skill, and MCP call logs live in the CLI. "
+            "Defaults to config value."
+        ),
+    )
+    parser.add_argument(
+        "--show-config",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Show the startup configuration summary in the CLI. "
             "Defaults to config value."
         ),
     )
@@ -1746,7 +1930,9 @@ def build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
     _put_override(overrides, "paths", "memory_dir", args.memory_dir)
     _put_override(overrides, "paths", "trace_dir", args.trace_dir)
     _put_override(overrides, "paths", "mcp_config_path", args.mcp_config)
+    _put_override(overrides, "agent", "provider", args.agent_provider)
     _put_override(overrides, "agent", "model", args.agent_model)
+    _put_override(overrides, "agent", "model_kwargs", args.agent_model_kwargs)
     _put_override(overrides, "agent", "user_id", args.user_id)
     _put_override(overrides, "agent", "max_tool_rounds", args.max_tool_rounds)
     _put_override(
@@ -1772,8 +1958,40 @@ def build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
             "cross_encoder",
             args.cross_encoder == "on",
         )
+    _put_override(
+        overrides,
+        "retrieval",
+        "embedding_provider",
+        args.embedding_provider,
+    )
+    _put_override(overrides, "retrieval", "embedding_model", args.embedding_model)
+    _put_override(
+        overrides,
+        "retrieval",
+        "embedding_kwargs",
+        args.embedding_model_kwargs,
+    )
+    _put_override(overrides, "retrieval", "reranker_provider", args.reranker_provider)
+    _put_override(overrides, "retrieval", "reranker_model", args.reranker_model)
+    _put_override(
+        overrides,
+        "retrieval",
+        "reranker_kwargs",
+        args.reranker_model_kwargs,
+    )
+    _put_override(overrides, "retrieval", "reranker_device", args.reranker_device)
+    _put_override(
+        overrides,
+        "retrieval",
+        "reranker_batch_size",
+        args.reranker_batch_size,
+    )
+    _put_override(overrides, "llm", "rewrite_provider", args.rewrite_provider)
     _put_override(overrides, "llm", "rewrite_model", args.rewrite_model)
+    _put_override(overrides, "llm", "rewrite_kwargs", args.rewrite_model_kwargs)
+    _put_override(overrides, "llm", "memory_provider", args.memory_provider)
     _put_override(overrides, "llm", "memory_model", args.memory_model)
+    _put_override(overrides, "llm", "memory_kwargs", args.memory_model_kwargs)
     _put_override(overrides, "llm", "retry_attempts", args.llm_retry_attempts)
     if args.llm_timeout is not None:
         overrides.setdefault("llm", {})["timeout_s"] = (
@@ -1792,6 +2010,8 @@ def build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         _put_override(overrides, "trace", "enabled", args.trace == "on")
     if args.live_events is not None:
         _put_override(overrides, "trace", "live", args.live_events == "on")
+    if args.show_config is not None:
+        _put_override(overrides, "cli", "show_config", args.show_config == "on")
     return overrides
 
 

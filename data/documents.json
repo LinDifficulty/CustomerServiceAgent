@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "documents": {
+    "1cd768f3c62703932549e4bc": {
+      "doc_id": "1cd768f3c62703932549e4bc",
+      "source": "docs/尺码推荐.txt",
+      "source_hash": "",
+      "chunk_count": 1,
+      "parent_chunk_count": 1,
+      "chunk_size": 500,
+      "chunk_overlap": 100,
+      "parent_chunk_size": 0,
+      "parent_chunk_overlap": 0,
+      "chunking_strategy": "legacy_flat",
+      "indexed_at": "2026-05-08T09:57:36.267012+00:00",
+      "version": 1
+    },
+    "1d50994dd3b4b42d0204b6d2": {
+      "doc_id": "1d50994dd3b4b42d0204b6d2",
+      "source": "docs/洗涤养护.txt",
+      "source_hash": "",
+      "chunk_count": 6,
+      "parent_chunk_count": 6,
+      "chunk_size": 500,
+      "chunk_overlap": 100,
+      "parent_chunk_size": 0,
+      "parent_chunk_overlap": 0,
+      "chunking_strategy": "legacy_flat",
+      "indexed_at": "2026-05-08T09:57:36.267023+00:00",
+      "version": 1
+    },
+    "715b3b9fe919104b7034af0b": {
+      "doc_id": "715b3b9fe919104b7034af0b",
+      "source": "docs/颜色选择.txt",
+      "source_hash": "",
+      "chunk_count": 3,
+      "parent_chunk_count": 3,
+      "chunk_size": 500,
+      "chunk_overlap": 100,
+      "parent_chunk_size": 0,
+      "parent_chunk_overlap": 0,
+      "chunking_strategy": "legacy_flat",
+      "indexed_at": "2026-05-08T09:57:36.267026+00:00",
+      "version": 1
+    },
+    "7e71355bc1713eb93a0e9899": {
+      "doc_id": "7e71355bc1713eb93a0e9899",
+      "source": "docs/test.txt",
+      "source_hash": "",
+      "chunk_count": 2,
+      "parent_chunk_count": 2,
+      "chunk_size": 500,
+      "chunk_overlap": 100,
+      "parent_chunk_size": 0,
+      "parent_chunk_overlap": 0,
+      "chunking_strategy": "legacy_flat",
+      "indexed_at": "2026-05-08T09:57:36.267028+00:00",
+      "version": 1
+    }
+  }
+}

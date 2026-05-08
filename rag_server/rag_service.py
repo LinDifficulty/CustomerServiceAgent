@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import warnings
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,42 @@ with warnings.catch_warnings():
 # 支持的文档格式集合，仅处理这些扩展名的文件。
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 DOCUMENTS_MANIFEST_VERSION = 1
+CHUNKING_STRATEGY = "parent_child"
+PARENT_CHILD_OVERFETCH_FACTOR = 5
+MULTI_VECTOR_STRATEGY = "summary_keyword_semantic_v1"
+MULTI_VECTOR_TYPES = ("summary", "keyword", "semantic")
+DEFAULT_MULTI_VECTOR_WEIGHTS = {
+    "summary": 0.25,
+    "keyword": 0.25,
+    "semantic": 0.5,
+}
+MAX_SUMMARY_EMBEDDING_CHARS = 240
+MAX_KEYWORD_TERMS = 16
+KEYWORD_STOPWORDS = {
+    "的",
+    "了",
+    "和",
+    "与",
+    "或",
+    "是",
+    "在",
+    "对",
+    "及",
+    "以及",
+    "等",
+    "为",
+    "有",
+    "可以",
+    "需要",
+    "如果",
+    "一个",
+    "这个",
+    "那个",
+    "进行",
+    "使用",
+    "用户",
+    "商品",
+}
 
 
 def _utc_now() -> str:
@@ -39,7 +77,7 @@ class RAGService:
     """轻量 RAG 服务。
 
     支持：
-    1. DashScope 向量化 + FAISS 向量检索
+    1. DashScope 向量化 + FAISS 多向量检索
     2. BM25 关键词检索
     3. 向量 + BM25 混合召回
     4. Cross-Encoder 精排
@@ -55,11 +93,14 @@ class RAGService:
         reranker_device: str | None = None,
         reranker_batch_size: int = 16,
         default_use_bm25: bool = True,
-        default_use_rerank: bool = True,
+        default_use_rerank: bool = False,
         default_candidate_top_k: int = 20,
         chunk_size: int = 500,
         chunk_overlap: int = 100,
+        parent_chunk_size: int | None = None,
+        parent_chunk_overlap: int | None = None,
         trace_recorder: TraceRecorder | None = None,
+        multi_vector_weights: dict[str, float] | None = None,
     ) -> None:
         # 所有索引和元数据都保存在 data_dir，方便持久化复用。
         self.base_dir = Path(data_dir)
@@ -70,6 +111,18 @@ class RAGService:
         self.documents_path = self.base_dir / "documents.json"
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.parent_chunk_size = parent_chunk_size or max(chunk_size * 3, chunk_size)
+        self.parent_chunk_overlap = (
+            min(chunk_overlap * 2, self.parent_chunk_size - 1)
+            if parent_chunk_overlap is None
+            else parent_chunk_overlap
+        )
+        self._validate_chunking_config(
+            child_chunk_size=self.chunk_size,
+            child_chunk_overlap=self.chunk_overlap,
+            parent_chunk_size=self.parent_chunk_size,
+            parent_chunk_overlap=self.parent_chunk_overlap,
+        )
 
         # 向量模型默认使用 DashScope，也支持外部传入自定义 embeddings。
         self.embeddings = embeddings or DashScopeEmbeddings(model=model_name)
@@ -83,19 +136,27 @@ class RAGService:
         self.default_use_rerank = default_use_rerank
         self.default_candidate_top_k = default_candidate_top_k
         self.trace_recorder = trace_recorder
+        self.multi_vector_weights = self._normalize_multi_vector_weights(
+            multi_vector_weights
+        )
 
         self.documents = self._load_documents_manifest()
         self.records = self._load_records()
-        self._reconcile_documents_manifest()
+        documents_changed = self._reconcile_documents_manifest()
         self.bm25: BM25Plus | None = None
+        self.vector_rows = self._build_vector_rows()
         self.index = self._load_or_create_index()
         self._rebuild_bm25()
+        if documents_changed:
+            self._persist_documents_manifest()
 
     def add_documents(
         self,
         file_paths: list[str],
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
+        parent_chunk_size: int | None = None,
+        parent_chunk_overlap: int | None = None,
     ) -> dict:
         """Upsert documents by source path.
 
@@ -107,6 +168,8 @@ class RAGService:
             file_paths,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            parent_chunk_size=parent_chunk_size,
+            parent_chunk_overlap=parent_chunk_overlap,
         )
 
     def upsert_documents(
@@ -114,20 +177,33 @@ class RAGService:
         file_paths: list[str],
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
+        parent_chunk_size: int | None = None,
+        parent_chunk_overlap: int | None = None,
     ) -> dict:
         """Add new documents or replace changed documents in the local index."""
         actual_chunk_size = chunk_size or self.chunk_size
         actual_chunk_overlap = (
             self.chunk_overlap if chunk_overlap is None else chunk_overlap
         )
-        if actual_chunk_overlap >= actual_chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        actual_parent_chunk_size = parent_chunk_size or self.parent_chunk_size
+        actual_parent_chunk_overlap = (
+            self.parent_chunk_overlap
+            if parent_chunk_overlap is None
+            else parent_chunk_overlap
+        )
+        self._validate_chunking_config(
+            child_chunk_size=actual_chunk_size,
+            child_chunk_overlap=actual_chunk_overlap,
+            parent_chunk_size=actual_parent_chunk_size,
+            parent_chunk_overlap=actual_parent_chunk_overlap,
+        )
 
         records_to_add: list[dict] = []
         added_sources: list[str] = []
         updated_sources: list[str] = []
         skipped_sources: list[str] = []
         deleted_chunks = 0
+        added_parent_chunks = 0
         changed_documents = False
 
         for file_path in file_paths:
@@ -136,6 +212,8 @@ class RAGService:
                 path,
                 actual_chunk_size,
                 actual_chunk_overlap,
+                actual_parent_chunk_size,
+                actual_parent_chunk_overlap,
             )
             doc_id = document_info["doc_id"]
             existing_info = self.documents.get(doc_id)
@@ -145,6 +223,8 @@ class RAGService:
                 document_info,
                 actual_chunk_size,
                 actual_chunk_overlap,
+                actual_parent_chunk_size,
+                actual_parent_chunk_overlap,
             ):
                 skipped_sources.append(document_info["source"])
                 continue
@@ -160,18 +240,23 @@ class RAGService:
 
             self.documents[doc_id] = document_info
             records_to_add.extend(new_records)
+            added_parent_chunks += int(document_info.get("parent_chunk_count") or 0)
             changed_documents = True
 
         if records_to_add:
             self.records.extend(records_to_add)
 
         if changed_documents:
-            self._rebuild_vector_index()
+            if deleted_chunks > 0:
+                self._rebuild_vector_index()
+            elif records_to_add:
+                self._extend_vector_index(records_to_add)
             self._rebuild_bm25()
             self._persist()
 
         result = {
             "added_chunks": len(records_to_add),
+            "added_parent_chunks": added_parent_chunks,
             "deleted_chunks": deleted_chunks,
             "sources": sorted({record["source"] for record in records_to_add}),
             "added_documents": sorted(added_sources),
@@ -186,12 +271,16 @@ class RAGService:
         file_path: str,
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
+        parent_chunk_size: int | None = None,
+        parent_chunk_overlap: int | None = None,
     ) -> dict:
         """Replace one indexed document if the file content changed."""
         return self.upsert_documents(
             [file_path],
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            parent_chunk_size=parent_chunk_size,
+            parent_chunk_overlap=parent_chunk_overlap,
         )
 
     def delete_document(self, document_ref: str) -> dict:
@@ -226,12 +315,16 @@ class RAGService:
         remove_missing: bool = False,
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
+        parent_chunk_size: int | None = None,
+        parent_chunk_overlap: int | None = None,
     ) -> dict:
         """Upsert the given files and optionally remove documents not in the set."""
         result = self.upsert_documents(
             file_paths,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            parent_chunk_size=parent_chunk_size,
+            parent_chunk_overlap=parent_chunk_overlap,
         )
         if not remove_missing:
             return result
@@ -283,32 +376,36 @@ class RAGService:
             )
             return []
 
-        limit = min(top_k, self.index.ntotal)
-        scores, indices = self.index.search(self._embed_texts([query]), limit)
+        limit = self._candidate_limit(top_k)
+        vector_details = self._vector_score_details_map(query, limit)
 
-        results = []
-        for raw_score, idx in zip(scores[0], indices[0], strict=False):
-            if idx < 0:
-                continue
-            vector_score = self._normalize_vector_score(float(raw_score))
-            results.append(
+        candidate_results = []
+        for idx, details in vector_details.items():
+            vector_score = float(details["score"])
+            candidate_results.append(
                 self._build_result(
-                    idx=int(idx),
+                    idx=idx,
                     score=vector_score,
                     vector_score=vector_score,
                     bm25_score=0.0,
                     hybrid_score=vector_score,
                     rerank_score=None,
-                    retrieval_mode="vector",
+                    retrieval_mode="multi_vector",
+                    multi_vector_scores=details["scores"],
+                    matched_vector_types=details["matched_vector_types"],
+                    best_vector_type=details["best_vector_type"],
                 )
             )
 
-        results.sort(key=lambda item: item["score"], reverse=True)
+        candidate_results.sort(key=lambda item: item["score"], reverse=True)
+        results = self._deduplicate_parent_results(candidate_results)[:top_k]
         self._trace_event(
             "rag.search_by_vector",
             {
                 "query": query,
                 "top_k": top_k,
+                "candidate_count": len(candidate_results),
+                "vector_row_count": len(self.vector_rows),
                 "result_count": len(results),
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
                 "results": [
@@ -384,14 +481,14 @@ class RAGService:
             return []
 
         normalized_scores = self._normalize_bm25_scores(raw_scores)
-        top_indices = np.argsort(raw_scores)[::-1][: min(top_k, len(raw_scores))]
+        top_indices = np.argsort(raw_scores)[::-1][: self._candidate_limit(top_k)]
 
-        results = []
+        candidate_results = []
         for idx in top_indices:
             if raw_scores[idx] <= 0:
                 continue
             bm25_score = float(normalized_scores[idx])
-            results.append(
+            candidate_results.append(
                 self._build_result(
                     idx=int(idx),
                     score=bm25_score,
@@ -403,7 +500,8 @@ class RAGService:
                 )
             )
 
-        results.sort(key=lambda item: item["score"], reverse=True)
+        candidate_results.sort(key=lambda item: item["score"], reverse=True)
+        results = self._deduplicate_parent_results(candidate_results)[:top_k]
         self._trace_event(
             "rag.search_by_bm25",
             {
@@ -411,6 +509,7 @@ class RAGService:
                 "top_k": top_k,
                 "use_bm25": actual_use_bm25,
                 "tokens": query_tokens,
+                "candidate_count": len(candidate_results),
                 "result_count": len(results),
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
                 "results": [
@@ -449,8 +548,11 @@ class RAGService:
         actual_bm25_weight = bm25_weight if actual_use_bm25 else 0.0
         self._validate_weights(actual_vector_weight, actual_bm25_weight)
 
-        limit = min(top_k, len(self.records))
-        vector_scores = self._vector_score_map(query, limit)
+        limit = self._candidate_limit(top_k)
+        vector_details = self._vector_score_details_map(query, limit)
+        vector_scores = {
+            idx: float(details["score"]) for idx, details in vector_details.items()
+        }
         bm25_scores = self._bm25_score_map(query, limit) if actual_use_bm25 else {}
         candidate_ids = set(vector_scores) | set(bm25_scores)
 
@@ -458,6 +560,14 @@ class RAGService:
         for idx in candidate_ids:
             vector_score = vector_scores.get(idx, 0.0)
             bm25_score = bm25_scores.get(idx, 0.0)
+            details = vector_details.get(
+                idx,
+                {
+                    "scores": {},
+                    "matched_vector_types": [],
+                    "best_vector_type": None,
+                },
+            )
             hybrid_score = (
                 actual_vector_weight * vector_score
                 + actual_bm25_weight * bm25_score
@@ -470,12 +580,15 @@ class RAGService:
                     bm25_score=bm25_score,
                     hybrid_score=hybrid_score,
                     rerank_score=None,
-                    retrieval_mode="hybrid" if actual_use_bm25 else "vector",
+                    retrieval_mode="hybrid" if actual_use_bm25 else "multi_vector",
+                    multi_vector_scores=details["scores"],
+                    matched_vector_types=details["matched_vector_types"],
+                    best_vector_type=details["best_vector_type"],
                 )
             )
 
         ranked_results.sort(key=lambda item: item["score"], reverse=True)
-        results = ranked_results[:top_k]
+        results = self._deduplicate_parent_results(ranked_results)[:top_k]
         self._trace_event(
             "rag.search_by_hybrid",
             {
@@ -485,6 +598,7 @@ class RAGService:
                 "bm25_weight": actual_bm25_weight,
                 "use_bm25": actual_use_bm25,
                 "candidate_count": len(candidate_ids),
+                "vector_row_count": len(self.vector_rows),
                 "result_count": len(results),
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
                 "results": [
@@ -626,6 +740,7 @@ class RAGService:
         """清空 FAISS、BM25 和元数据。"""
         self.records = []
         self.documents = {}
+        self.vector_rows = []
         self.index = self._create_index()
         self._rebuild_bm25()
         self._persist()
@@ -635,31 +750,54 @@ class RAGService:
         path: Path,
         chunk_size: int,
         chunk_overlap: int,
+        parent_chunk_size: int,
+        parent_chunk_overlap: int,
     ) -> tuple[list[dict], dict]:
         text = self._read_document(path)
         source = str(path)
         doc_id = self._document_id_for_path(path)
         source_hash = self._hash_text(text)
-        chunks = self._split_text(text, chunk_size, chunk_overlap)
+        parent_chunks = self._split_text(
+            text,
+            parent_chunk_size,
+            parent_chunk_overlap,
+        )
         indexed_at = _utc_now()
 
-        records = [
-            self._build_record(
-                doc_id=doc_id,
-                source=source,
-                source_hash=source_hash,
-                content=content,
-                chunk_index=chunk_index,
-            )
-            for chunk_index, content in enumerate(chunks)
-        ]
+        records: list[dict] = []
+        for parent_index, parent_content in enumerate(parent_chunks):
+            parent_content_hash = self._hash_text(parent_content)
+            parent_id = f"{doc_id}:parent:{parent_index}:{parent_content_hash[:12]}"
+            child_chunks = self._split_text(parent_content, chunk_size, chunk_overlap)
+            for child_index, child_content in enumerate(child_chunks):
+                records.append(
+                    self._build_record(
+                        doc_id=doc_id,
+                        source=source,
+                        source_hash=source_hash,
+                        child_content=child_content,
+                        child_chunk_index=len(records),
+                        child_index=child_index,
+                        parent_id=parent_id,
+                        parent_index=parent_index,
+                        parent_content=parent_content,
+                        parent_content_hash=parent_content_hash,
+                    )
+                )
+
         document_info = {
             "doc_id": doc_id,
             "source": source,
             "source_hash": source_hash,
             "chunk_count": len(records),
+            "parent_chunk_count": len(parent_chunks),
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
+            "parent_chunk_size": parent_chunk_size,
+            "parent_chunk_overlap": parent_chunk_overlap,
+            "chunking_strategy": CHUNKING_STRATEGY,
+            "embedding_strategy": MULTI_VECTOR_STRATEGY,
+            "embedding_types": list(MULTI_VECTOR_TYPES),
             "indexed_at": indexed_at,
             "version": 1,
         }
@@ -671,23 +809,43 @@ class RAGService:
         doc_id: str,
         source: str,
         source_hash: str,
-        content: str,
-        chunk_index: int,
+        child_content: str,
+        child_chunk_index: int,
+        child_index: int,
+        parent_id: str,
+        parent_index: int,
+        parent_content: str,
+        parent_content_hash: str,
     ) -> dict:
-        content_hash = self._hash_text(content)
-        chunk_id = f"{doc_id}:{chunk_index}:{content_hash[:12]}"
+        content_hash = self._hash_text(child_content)
+        child_chunk_id = (
+            f"{doc_id}:parent:{parent_index}:child:{child_index}:{content_hash[:12]}"
+        )
         return {
-            "id": chunk_id,
+            "id": child_chunk_id,
             "doc_id": doc_id,
             "source": source,
             "source_hash": source_hash,
             "content_hash": content_hash,
-            "content": content,
+            "content": child_content,
+            "embedding_texts": self._build_embedding_texts(child_content),
+            "parent_id": parent_id,
+            "parent_content_hash": parent_content_hash,
+            "parent_content": parent_content,
             "metadata": {
                 "doc_id": doc_id,
-                "chunk_id": chunk_id,
-                "chunk_index": chunk_index,
+                "chunk_id": parent_id,
+                "chunk_index": parent_index,
+                "parent_id": parent_id,
+                "parent_index": parent_index,
+                "parent_content_hash": parent_content_hash,
+                "child_chunk_id": child_chunk_id,
+                "child_chunk_index": child_chunk_index,
+                "child_index": child_index,
                 "source_hash": source_hash,
+                "chunking_strategy": CHUNKING_STRATEGY,
+                "embedding_strategy": MULTI_VECTOR_STRATEGY,
+                "embedding_types": list(MULTI_VECTOR_TYPES),
             },
         }
 
@@ -697,6 +855,8 @@ class RAGService:
         new_info: dict,
         chunk_size: int,
         chunk_overlap: int,
+        parent_chunk_size: int,
+        parent_chunk_overlap: int,
     ) -> bool:
         if existing_info is None:
             return False
@@ -704,6 +864,11 @@ class RAGService:
             existing_info.get("source_hash") == new_info.get("source_hash")
             and int(existing_info.get("chunk_size") or 0) == chunk_size
             and int(existing_info.get("chunk_overlap") or 0) == chunk_overlap
+            and int(existing_info.get("parent_chunk_size") or 0) == parent_chunk_size
+            and int(existing_info.get("parent_chunk_overlap") or 0)
+            == parent_chunk_overlap
+            and existing_info.get("chunking_strategy") == CHUNKING_STRATEGY
+            and existing_info.get("embedding_strategy") == MULTI_VECTOR_STRATEGY
         )
 
     def _remove_document_records(self, doc_id: str) -> int:
@@ -769,35 +934,165 @@ class RAGService:
         )
         return splitter.split_text(text)
 
+    def _build_embedding_texts(self, content: str) -> dict[str, str]:
+        normalized = self._normalize_whitespace(content)
+        summary = self._chunk_summary_text(normalized)
+        keywords = self._chunk_keyword_text(normalized)
+        return {
+            "summary": f"摘要: {summary or normalized}",
+            "keyword": f"关键词: {keywords or summary or normalized}",
+            "semantic": f"语义: {normalized}",
+        }
+
+    def _normalize_embedding_texts(self, value: Any, content: str) -> dict[str, str]:
+        defaults = self._build_embedding_texts(content)
+        if not isinstance(value, dict):
+            return defaults
+
+        normalized = {}
+        for vector_type in MULTI_VECTOR_TYPES:
+            text = str(value.get(vector_type) or "").strip()
+            normalized[vector_type] = text or defaults[vector_type]
+        return normalized
+
+    def _build_vector_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        for record_index, record in enumerate(self.records):
+            embedding_texts = self._normalize_embedding_texts(
+                record.get("embedding_texts"),
+                str(record.get("content") or ""),
+            )
+            record["embedding_texts"] = embedding_texts
+            for vector_type in MULTI_VECTOR_TYPES:
+                rows.append(
+                    {
+                        "record_index": record_index,
+                        "vector_type": vector_type,
+                        "text": embedding_texts[vector_type],
+                    }
+                )
+        return rows
+
+    def _chunk_summary_text(self, text: str) -> str:
+        if not text:
+            return ""
+
+        sentences = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？；.!?;])\s*|\n+", text)
+            if item.strip()
+        ]
+        summary = " ".join(sentences[:2]) if sentences else text
+        if len(summary) <= MAX_SUMMARY_EMBEDDING_CHARS:
+            return summary
+        return summary[:MAX_SUMMARY_EMBEDDING_CHARS].rstrip()
+
+    def _chunk_keyword_text(self, text: str) -> str:
+        keywords = self._extract_keywords(text)
+        return " ".join(keywords)
+
+    def _extract_keywords(self, text: str) -> list[str]:
+        first_seen: dict[str, int] = {}
+        tokens: list[str] = []
+        for token in self._tokenize(text):
+            if not self._is_keyword_token(token):
+                continue
+            if token not in first_seen:
+                first_seen[token] = len(first_seen)
+            tokens.append(token)
+
+        if not tokens:
+            return []
+
+        counts = Counter(tokens)
+        ranked = sorted(
+            counts,
+            key=lambda token: (-counts[token], first_seen[token], token),
+        )
+        return ranked[:MAX_KEYWORD_TERMS]
+
+    def _is_keyword_token(self, token: str) -> bool:
+        if token in KEYWORD_STOPWORDS:
+            return False
+        if re.fullmatch(r"[\W_]+", token):
+            return False
+        return any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in token)
+
+    def _normalize_whitespace(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
     def _embed_texts(self, texts: list[str]) -> np.ndarray:
         vectors = self.embeddings.embed_documents(texts)
         matrix = np.asarray(vectors, dtype="float32")
         faiss.normalize_L2(matrix)
         return matrix
 
+    def _embed_query(self, text: str) -> np.ndarray:
+        if hasattr(self.embeddings, "embed_query"):
+            vector = self.embeddings.embed_query(text)
+        else:
+            vector = self.embeddings.embed_documents([text])[0]
+        matrix = np.asarray([vector], dtype="float32")
+        faiss.normalize_L2(matrix)
+        return matrix
+
     def _load_or_create_index(self) -> faiss.Index:
         if self.index_path.exists():
             index = faiss.read_index(str(self.index_path))
-            if index.ntotal == len(self.records):
+            if index.ntotal == len(self.vector_rows):
                 return index
-            return self._rebuild_vector_index()
-        if self.records:
-            return self._rebuild_vector_index()
+            return self._rebuild_and_persist_vector_index()
+        if self.vector_rows:
+            return self._rebuild_and_persist_vector_index()
         return self._create_index()
 
     def _create_index(self) -> faiss.Index:
-        dimension = len(self.embeddings.embed_query("test"))
-        return faiss.IndexFlatIP(dimension)
+        return faiss.IndexFlatIP(0)
+
+    def _rebuild_and_persist_vector_index(self) -> faiss.Index:
+        index = self._rebuild_vector_index()
+        faiss.write_index(index, str(self.index_path))
+        return index
 
     def _rebuild_vector_index(self) -> faiss.Index:
-        if not self.records:
+        self.vector_rows = self._build_vector_rows()
+        if not self.vector_rows:
             self.index = self._create_index()
             return self.index
 
-        vectors = self._embed_texts([record["content"] for record in self.records])
+        vectors = self._embed_texts([row["text"] for row in self.vector_rows])
         self.index = faiss.IndexFlatIP(vectors.shape[1])
         self.index.add(vectors)
         return self.index
+
+    def _extend_vector_index(self, new_records: list[dict]) -> None:
+        """Embed only *new_records* and append to the existing FAISS index."""
+        new_rows: list[dict] = []
+        base_record_index = len(self.records) - len(new_records)
+        for offset, record in enumerate(new_records):
+            record_index = base_record_index + offset
+            embedding_texts = self._normalize_embedding_texts(
+                record.get("embedding_texts"),
+                str(record.get("content") or ""),
+            )
+            record["embedding_texts"] = embedding_texts
+            for vector_type in MULTI_VECTOR_TYPES:
+                new_rows.append(
+                    {
+                        "record_index": record_index,
+                        "vector_type": vector_type,
+                        "text": embedding_texts[vector_type],
+                    }
+                )
+
+        if not new_rows:
+            return
+
+        vectors = self._embed_texts([row["text"] for row in new_rows])
+        if self.index.d == 0:
+            self.index = faiss.IndexFlatIP(vectors.shape[1])
+        self.index.add(vectors)
+        self.vector_rows.extend(new_rows)
 
     def _rebuild_bm25(self) -> None:
         # BM25 不单独持久化，启动时根据已有 chunk 重建即可。
@@ -818,16 +1113,80 @@ class RAGService:
         ]
 
     def _vector_score_map(self, query: str, limit: int) -> dict[int, float]:
+        return {
+            idx: float(details["score"])
+            for idx, details in self._vector_score_details_map(query, limit).items()
+        }
+
+    def _vector_score_details_map(self, query: str, limit: int) -> dict[int, dict]:
         if self.index.ntotal == 0:
             return {}
 
-        scores, indices = self.index.search(self._embed_texts([query]), limit)
-        result: dict[int, float] = {}
-        for raw_score, idx in zip(scores[0], indices[0], strict=False):
-            if idx < 0:
+        row_limit = self._vector_row_limit(limit)
+        if row_limit <= 0:
+            return {}
+
+        scores, indices = self.index.search(self._embed_query(query), row_limit)
+        hits: dict[int, dict] = {}
+        for raw_score, row_idx in zip(scores[0], indices[0], strict=False):
+            if row_idx < 0 or row_idx >= len(self.vector_rows):
                 continue
-            result[int(idx)] = self._normalize_vector_score(float(raw_score))
+
+            vector_row = self.vector_rows[int(row_idx)]
+            record_idx = int(vector_row["record_index"])
+            vector_type = str(vector_row["vector_type"])
+            vector_score = self._normalize_vector_score(float(raw_score))
+            hit = hits.setdefault(
+                record_idx,
+                {
+                    "scores": {},
+                    "row_indices": {},
+                },
+            )
+            previous = hit["scores"].get(vector_type)
+            if previous is None or vector_score > previous:
+                hit["scores"][vector_type] = vector_score
+                hit["row_indices"][vector_type] = int(row_idx)
+
+        result: dict[int, dict] = {}
+        for record_idx, hit in hits.items():
+            vector_scores = hit["scores"]
+            matched_vector_types = sorted(
+                vector_scores,
+                key=lambda item: vector_scores[item],
+                reverse=True,
+            )
+            result[record_idx] = {
+                "score": self._aggregate_multi_vector_scores(vector_scores),
+                "scores": {
+                    vector_type: float(vector_scores[vector_type])
+                    for vector_type in MULTI_VECTOR_TYPES
+                    if vector_type in vector_scores
+                },
+                "matched_vector_types": matched_vector_types,
+                "best_vector_type": (
+                    matched_vector_types[0] if matched_vector_types else None
+                ),
+                "row_indices": hit["row_indices"],
+            }
         return result
+
+    def _aggregate_multi_vector_scores(self, scores: dict[str, float]) -> float:
+        if not scores:
+            return 0.0
+
+        weighted_total = 0.0
+        matched_weight = 0.0
+        for vector_type, score in scores.items():
+            weight = self.multi_vector_weights.get(vector_type, 0.0)
+            if weight <= 0:
+                continue
+            weighted_total += weight * float(score)
+            matched_weight += weight
+
+        if matched_weight <= 0:
+            return max(float(score) for score in scores.values())
+        return max(0.0, min(1.0, weighted_total / matched_weight))
 
     def _bm25_score_map(self, query: str, limit: int) -> dict[int, float]:
         if self.bm25 is None:
@@ -859,11 +1218,90 @@ class RAGService:
             return np.zeros_like(scores)
         return scores / max_score
 
+    def _candidate_limit(self, top_k: int) -> int:
+        requested = max(1, top_k)
+        return min(requested * PARENT_CHILD_OVERFETCH_FACTOR, len(self.records))
+
+    def _vector_row_limit(self, record_limit: int) -> int:
+        if not self.vector_rows:
+            return 0
+        requested = max(1, record_limit) * len(MULTI_VECTOR_TYPES)
+        return min(requested, len(self.vector_rows))
+
+    def _deduplicate_parent_results(self, results: list[dict]) -> list[dict]:
+        deduplicated: list[dict] = []
+        seen_parent_keys: set[tuple[str, str]] = set()
+        for item in results:
+            parent_key = self._parent_result_key(item)
+            if parent_key in seen_parent_keys:
+                continue
+            seen_parent_keys.add(parent_key)
+            deduplicated.append(item)
+        return deduplicated
+
+    def _parent_result_key(self, item: dict) -> tuple[str, str]:
+        metadata = item.get("metadata") or {}
+        doc_id = str(item.get("doc_id") or metadata.get("doc_id") or "")
+        parent_id = str(
+            metadata.get("parent_id")
+            or metadata.get("chunk_id")
+            or metadata.get("chunk_index")
+            or ""
+        )
+        return doc_id, parent_id
+
     def _validate_weights(self, vector_weight: float, bm25_weight: float) -> None:
         if vector_weight < 0 or bm25_weight < 0:
             raise ValueError("vector_weight and bm25_weight must be non-negative")
         if vector_weight == 0 and bm25_weight == 0:
             raise ValueError("At least one retrieval weight must be greater than 0")
+
+    def _normalize_multi_vector_weights(
+        self,
+        weights: dict[str, float] | None,
+    ) -> dict[str, float]:
+        normalized = dict(DEFAULT_MULTI_VECTOR_WEIGHTS)
+        if weights is None:
+            return normalized
+
+        unknown = sorted(set(weights) - set(MULTI_VECTOR_TYPES))
+        if unknown:
+            raise ValueError(
+                "Unknown multi-vector weight(s): " + ", ".join(unknown)
+            )
+
+        for vector_type, raw_weight in weights.items():
+            weight = float(raw_weight)
+            if weight < 0:
+                raise ValueError("multi-vector weights must be non-negative")
+            normalized[vector_type] = weight
+
+        if sum(normalized.values()) <= 0:
+            raise ValueError("At least one multi-vector weight must be greater than 0")
+        return normalized
+
+    def _validate_chunking_config(
+        self,
+        *,
+        child_chunk_size: int,
+        child_chunk_overlap: int,
+        parent_chunk_size: int,
+        parent_chunk_overlap: int,
+    ) -> None:
+        if child_chunk_size <= 0 or parent_chunk_size <= 0:
+            raise ValueError("chunk_size and parent_chunk_size must be positive")
+        if child_chunk_overlap < 0 or parent_chunk_overlap < 0:
+            raise ValueError("chunk overlaps must be non-negative")
+        if child_chunk_overlap >= child_chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        if parent_chunk_overlap >= parent_chunk_size:
+            raise ValueError(
+                "parent_chunk_overlap must be smaller than parent_chunk_size"
+            )
+        if child_chunk_size > parent_chunk_size:
+            raise ValueError(
+                "chunk_size must be smaller than or equal to parent_chunk_size"
+            )
 
     def _get_reranker(self) -> Any:
         # 懒加载 reranker，避免只做入库时也下载和初始化 Cross-Encoder。
@@ -894,15 +1332,24 @@ class RAGService:
         hybrid_score: float,
         rerank_score: float | None,
         retrieval_mode: str,
+        multi_vector_scores: dict[str, float] | None = None,
+        matched_vector_types: list[str] | None = None,
+        best_vector_type: str | None = None,
     ) -> dict:
         record = self.records[idx]
+        child_content = record["content"]
+        parent_content = record.get("parent_content") or child_content
         return {
             "score": float(score),
             "vector_score": float(vector_score),
             "bm25_score": float(bm25_score),
             "hybrid_score": float(hybrid_score),
             "rerank_score": None if rerank_score is None else float(rerank_score),
-            "content": record["content"],
+            "multi_vector_scores": multi_vector_scores or {},
+            "matched_vector_types": matched_vector_types or [],
+            "best_vector_type": best_vector_type,
+            "content": parent_content,
+            "child_content": child_content,
             "source": record["source"],
             "doc_id": record.get("doc_id"),
             "metadata": record["metadata"],
@@ -929,7 +1376,19 @@ class RAGService:
             if not isinstance(metadata, dict):
                 metadata = {}
 
-            chunk_index = self._coerce_int(
+            parent_index = self._coerce_int(
+                metadata.get("parent_index", metadata.get("chunk_index")),
+                fallback=fallback_index,
+            )
+            child_chunk_index = self._coerce_int(
+                metadata.get("child_chunk_index"),
+                fallback=fallback_index,
+            )
+            child_index = self._coerce_int(
+                metadata.get("child_index"),
+                fallback=0,
+            )
+            legacy_chunk_index = self._coerce_int(
                 metadata.get("chunk_index"),
                 fallback=fallback_index,
             )
@@ -946,28 +1405,67 @@ class RAGService:
             content_hash = str(
                 raw_record.get("content_hash") or self._hash_text(content)
             )
-            chunk_id = str(
-                raw_record.get("id")
+            parent_content = str(raw_record.get("parent_content") or content)
+            parent_content_hash = str(
+                raw_record.get("parent_content_hash")
+                or metadata.get("parent_content_hash")
+                or self._hash_text(parent_content)
+            )
+            parent_id = str(
+                raw_record.get("parent_id")
+                or metadata.get("parent_id")
                 or metadata.get("chunk_id")
-                or f"{doc_id}:{chunk_index}:{content_hash[:12]}"
+                or f"{doc_id}:parent:{parent_index}:{parent_content_hash[:12]}"
+            )
+            child_chunk_id = str(
+                raw_record.get("id")
+                or metadata.get("child_chunk_id")
+                or (
+                    f"{doc_id}:parent:{parent_index}:child:"
+                    f"{child_index}:{content_hash[:12]}"
+                    if metadata.get("parent_id")
+                    else metadata.get("chunk_id")
+                )
+                or f"{doc_id}:{legacy_chunk_index}:{content_hash[:12]}"
             )
             merged_metadata = {
                 **metadata,
                 "doc_id": doc_id,
-                "chunk_id": chunk_id,
-                "chunk_index": chunk_index,
+                "chunk_id": parent_id,
+                "chunk_index": parent_index,
+                "parent_id": parent_id,
+                "parent_index": parent_index,
+                "parent_content_hash": parent_content_hash,
+                "child_chunk_id": child_chunk_id,
+                "child_chunk_index": child_chunk_index,
+                "child_index": child_index,
             }
             if source_hash:
                 merged_metadata["source_hash"] = source_hash
+            if "chunking_strategy" in metadata:
+                merged_metadata["chunking_strategy"] = metadata["chunking_strategy"]
+            merged_metadata["embedding_strategy"] = str(
+                metadata.get("embedding_strategy") or MULTI_VECTOR_STRATEGY
+            )
+            merged_metadata["embedding_types"] = list(MULTI_VECTOR_TYPES)
+
+            embedding_texts = self._normalize_embedding_texts(
+                raw_record.get("embedding_texts"),
+                content,
+            )
 
             records.append(
                 {
-                    "id": chunk_id,
+                    "id": child_chunk_id,
                     "doc_id": doc_id,
                     "source": source,
                     "source_hash": source_hash,
                     "content_hash": content_hash,
                     "content": content,
+                    "embedding_texts": embedding_texts,
+                    "parent_id": parent_id,
+                    "parent_content_hash": parent_content_hash,
+                    "parent_content": parent_content,
                     "metadata": merged_metadata,
                 }
             )
@@ -1001,25 +1499,51 @@ class RAGService:
                     documents[doc_id] = dict(info)
         return documents
 
-    def _reconcile_documents_manifest(self) -> None:
+    def _reconcile_documents_manifest(self) -> bool:
         grouped_records: dict[str, list[dict]] = {}
         for record in self.records:
             grouped_records.setdefault(str(record["doc_id"]), []).append(record)
 
+        changed = False
         for doc_id, records in grouped_records.items():
             if doc_id in self.documents:
                 continue
             first = records[0]
+            record_strategy = first.get("metadata", {}).get("chunking_strategy")
+            parent_ids = {
+                str(
+                    record.get("parent_id")
+                    or record.get("metadata", {}).get("parent_id")
+                    or record.get("metadata", {}).get("chunk_id")
+                )
+                for record in records
+            }
             self.documents[doc_id] = {
                 "doc_id": doc_id,
                 "source": first["source"],
                 "source_hash": first.get("source_hash") or "",
                 "chunk_count": len(records),
+                "parent_chunk_count": len(parent_ids),
                 "chunk_size": self.chunk_size,
                 "chunk_overlap": self.chunk_overlap,
+                "parent_chunk_size": (
+                    self.parent_chunk_size
+                    if record_strategy == CHUNKING_STRATEGY
+                    else 0
+                ),
+                "parent_chunk_overlap": (
+                    self.parent_chunk_overlap
+                    if record_strategy == CHUNKING_STRATEGY
+                    else 0
+                ),
+                "chunking_strategy": record_strategy or "legacy_flat",
+                "embedding_strategy": MULTI_VECTOR_STRATEGY,
+                "embedding_types": list(MULTI_VECTOR_TYPES),
                 "indexed_at": _utc_now(),
                 "version": 1,
             }
+            changed = True
+        return changed
 
     def _persist_documents_manifest(self) -> None:
         payload = {

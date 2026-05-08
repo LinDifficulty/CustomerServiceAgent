@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
@@ -18,13 +19,16 @@ from langchain_community.chat_models import ChatTongyi
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from .config import DEFAULT_LIVE_EVENTS_ENABLED, ConfigError, load_app_config
 from .llm_retry import LLMRetryError, LLMRetryPolicy, ainvoke_with_retry
 from .memory_service import LLMMemoryExtractor, MemoryService
 from .mcp_service import DEFAULT_MCP_CONFIG_PATH, load_mcp_tools_from_config
 from .query_rewrite import LLMQueryRewriter, search_with_query_rewrites
 from .rag_service import RAGService
+from .reflection_service import ReflectionAgent
 from .skill_service import SkillRegistry, build_skill_tools
 from .trace_service import DEFAULT_TRACE_DIR, TraceRecorder, preview_text
+from .utils import coerce_message_content
 
 DEFAULT_AGENT_MODEL = "qwen3-max-2026-01-23"
 DEFAULT_USER_ID = "default_user"
@@ -32,6 +36,7 @@ DEFAULT_QUERY_REWRITE_MODE = "on"
 QUERY_REWRITE_MODES = ("on", "off", "rewrite_only", "multi_query")
 DEFAULT_MAX_TOOL_ROUNDS = 6
 DEFAULT_MAX_REPEATED_TOOL_CALLS = 2
+DEFAULT_REFLECTION_ENABLED = True
 
 
 class AgentState(TypedDict, total=False):
@@ -225,20 +230,6 @@ def build_retrieval_tool_with_rewrite(
     return search_product_knowledge
 
 
-def coerce_message_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("text"):
-                parts.append(str(item["text"]))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
-    return str(content)
-
-
 def latest_human_text(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -251,6 +242,276 @@ def latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
         if isinstance(message, AIMessage):
             return message
     return None
+
+
+def format_recent_tool_context(
+    messages: list[BaseMessage],
+    *,
+    max_messages: int = 6,
+    max_chars: int = 6000,
+) -> str:
+    tool_messages = [
+        message for message in messages if isinstance(message, ToolMessage)
+    ][-max_messages:]
+    if not tool_messages:
+        return ""
+
+    blocks = []
+    for index, message in enumerate(tool_messages, start=1):
+        content = coerce_message_content(message.content).strip()
+        if not content:
+            continue
+        blocks.append(f"工具结果{index}:\n{content}")
+
+    context = "\n\n".join(blocks)
+    if len(context) <= max_chars:
+        return context
+    return context[-max_chars:]
+
+
+def replace_ai_message_content(message: AIMessage, content: str) -> AIMessage:
+    try:
+        return message.model_copy(update={"content": content})
+    except AttributeError:
+        try:
+            return message.copy(update={"content": content})
+        except Exception:
+            return AIMessage(content=content)
+
+
+def message_usage_metadata(message: BaseMessage) -> dict[str, Any]:
+    """Extract provider token usage without depending on one provider schema."""
+    usage: dict[str, Any] = {}
+    usage_metadata = getattr(message, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        usage["usage_metadata"] = usage_metadata
+
+    response_metadata = getattr(message, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        token_usage = response_metadata.get("token_usage")
+        if token_usage is not None:
+            usage["token_usage"] = token_usage
+        model_name = response_metadata.get("model_name") or response_metadata.get(
+            "model"
+        )
+        if model_name is not None:
+            usage["model_name"] = model_name
+        finish_reason = response_metadata.get("finish_reason")
+        if finish_reason is not None:
+            usage["finish_reason"] = finish_reason
+    return usage
+
+
+def _compact_live_value(value: Any, *, max_chars: int = 180) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, bool | int | float):
+        text = str(value)
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return preview_text(text.replace("\n", "\\n"), max_chars=max_chars)
+
+
+def _live_elapsed_ms(record: dict[str, Any], payload: dict[str, Any]) -> float | None:
+    elapsed = record.get("elapsed_ms")
+    if not isinstance(elapsed, int | float):
+        elapsed = payload.get("elapsed_ms")
+    return float(elapsed) if isinstance(elapsed, int | float) else None
+
+
+def _format_live_elapsed(record: dict[str, Any], payload: dict[str, Any]) -> str:
+    elapsed = _live_elapsed_ms(record, payload)
+    if elapsed is None:
+        return ""
+    return f" elapsed={elapsed:.1f}ms"
+
+
+def _format_live_level(record: dict[str, Any]) -> str:
+    level = str(record.get("level") or "info")
+    return "" if level == "info" else f" level={level}"
+
+
+def _format_rag_live_event(
+    name: str,
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> str:
+    query = (
+        payload.get("query")
+        or payload.get("question")
+        or payload.get("original_query")
+    )
+    parts = [f"[实时][RAG] {name}"]
+    if query:
+        parts.append(f'query="{_compact_live_value(query, max_chars=90)}"')
+    if payload.get("rewritten_query"):
+        parts.append(
+            f'rewrite="{_compact_live_value(payload["rewritten_query"], max_chars=90)}"'
+        )
+    if payload.get("retrieval_queries"):
+        parts.append(
+            "queries="
+            + _compact_live_value(payload["retrieval_queries"], max_chars=140)
+        )
+    if payload.get("candidate_count") is not None:
+        parts.append(f"candidates={payload['candidate_count']}")
+    if payload.get("result_count") is not None:
+        parts.append(f"results={payload['result_count']}")
+    if payload.get("use_rerank") is not None:
+        parts.append(f"rerank={payload['use_rerank']}")
+    return " ".join(parts) + _format_live_level(record) + _format_live_elapsed(
+        record,
+        payload,
+    )
+
+
+def _format_memory_live_event(
+    name: str,
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> str:
+    parts = [f"[实时][Memory] {name}"]
+    if payload.get("user_id"):
+        parts.append(f"user={payload['user_id']}")
+    if payload.get("query"):
+        parts.append(f'query="{_compact_live_value(payload["query"], max_chars=90)}"')
+    layer_counts = payload.get("layer_counts")
+    if isinstance(layer_counts, dict):
+        parts.append(
+            "layers="
+            + ",".join(
+                f"{layer}:{count}" for layer, count in sorted(layer_counts.items())
+            )
+        )
+    if payload.get("memory_types"):
+        parts.append("types=" + _compact_live_value(payload["memory_types"]))
+    if payload.get("result_count") is not None:
+        parts.append(f"results={payload['result_count']}")
+    if payload.get("new_memory_count") is not None:
+        parts.append(f"new={payload['new_memory_count']}")
+    if payload.get("reason"):
+        parts.append(f"reason={payload['reason']}")
+    return " ".join(parts) + _format_live_level(record) + _format_live_elapsed(
+        record,
+        payload,
+    )
+
+
+def _format_skill_live_event(
+    name: str,
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> str:
+    parts = [f"[实时][Skill] {name}"]
+    if payload.get("explicit_skill_name"):
+        parts.append(f"explicit=/{payload['explicit_skill_name']}")
+    if payload.get("skill_name"):
+        parts.append(f"skill={payload['skill_name']}")
+    if payload.get("name"):
+        parts.append(f"skill={payload['name']}")
+    if payload.get("relative_path"):
+        parts.append(f"path={payload['relative_path']}")
+    if payload.get("available_skill_count") is not None:
+        parts.append(f"available={payload['available_skill_count']}")
+    if payload.get("skill_context_chars") is not None:
+        parts.append(f"context_chars={payload['skill_context_chars']}")
+    if payload.get("result_preview"):
+        parts.append(
+            f'result="{_compact_live_value(payload["result_preview"], max_chars=120)}"'
+        )
+    return " ".join(parts) + _format_live_level(record) + _format_live_elapsed(
+        record,
+        payload,
+    )
+
+
+def _format_mcp_live_event(
+    name: str,
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> str:
+    parts = [f"[实时][MCP] {name}"]
+    if payload.get("server_names"):
+        parts.append("servers=" + _compact_live_value(payload["server_names"]))
+    if payload.get("tool_names"):
+        parts.append("tools=" + _compact_live_value(payload["tool_names"]))
+    if payload.get("tool_name"):
+        parts.append(f"tool={payload['tool_name']}")
+    if payload.get("args") is not None:
+        parts.append("args=" + _compact_live_value(payload["args"], max_chars=160))
+    if payload.get("result_preview"):
+        parts.append(
+            f'result="{_compact_live_value(payload["result_preview"], max_chars=120)}"'
+        )
+    return " ".join(parts) + _format_live_level(record) + _format_live_elapsed(
+        record,
+        payload,
+    )
+
+
+def _format_tool_live_event(
+    name: str,
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> str:
+    category = str(payload.get("tool_category") or "")
+    if category not in {"rag", "skill", "mcp"}:
+        return ""
+    label = {"rag": "RAG", "skill": "Skill", "mcp": "MCP"}[category]
+    phase = "start" if name.endswith("_start") else "end"
+    parts = [f"[实时][{label}] tool.{phase}", f"tool={payload.get('tool_name', '')}"]
+    if phase == "start" and payload.get("args") is not None:
+        parts.append("args=" + _compact_live_value(payload["args"], max_chars=160))
+    if phase == "end" and payload.get("result_preview"):
+        parts.append(
+            f'result="{_compact_live_value(payload["result_preview"], max_chars=120)}"'
+        )
+    return " ".join(parts) + _format_live_level(record) + _format_live_elapsed(
+        record,
+        payload,
+    )
+
+
+def format_cli_live_event(record: dict[str, Any]) -> str:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    event_type = str(record.get("type") or "")
+    name = str(record.get("name") or "")
+    if event_type == "rag":
+        return _format_rag_live_event(name, payload, record)
+    if event_type in {"query_rewrite", "retrieval"}:
+        return _format_rag_live_event(name, payload, record)
+    if event_type == "memory":
+        return _format_memory_live_event(name, payload, record)
+    if event_type == "skill":
+        return _format_skill_live_event(name, payload, record)
+    if event_type == "mcp":
+        return _format_mcp_live_event(name, payload, record)
+    if event_type == "tool" and name in {
+        "agent.tool_call_start",
+        "agent.tool_call_end",
+    }:
+        return _format_tool_live_event(name, payload, record)
+    if event_type == "tool" and name == "tool.search_product_knowledge":
+        return _format_rag_live_event(name, payload, record)
+    return ""
+
+
+class CLILiveEventPrinter:
+    """Print selected trace records immediately during an interactive CLI turn."""
+
+    def __init__(self, enabled: bool = DEFAULT_LIVE_EVENTS_ENABLED) -> None:
+        self.enabled = enabled
+
+    def __call__(self, record: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        line = format_cli_live_event(record)
+        if line:
+            print(line, flush=True)
 
 
 MEMORY_LAYER_LABELS = {
@@ -454,6 +715,7 @@ def build_agent(
     rag: RAGService,
     *,
     query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
+    agent_model_name: str = DEFAULT_AGENT_MODEL,
     rewrite_model_name: str = DEFAULT_AGENT_MODEL,
     memory_service: MemoryService | None = None,
     memory_extractor: LLMMemoryExtractor | None = None,
@@ -466,6 +728,7 @@ def build_agent(
     llm_retry_policy: LLMRetryPolicy | None = None,
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS,
+    reflection_enabled: bool = DEFAULT_REFLECTION_ENABLED,
 ):
     actual_query_rewrite_mode = normalize_query_rewrite_mode(query_rewrite_mode)
     retry_policy = llm_retry_policy or LLMRetryPolicy()
@@ -487,14 +750,36 @@ def build_agent(
     )
     actual_skill_registry = skill_registry if skills_enabled else None
     skill_tools = (
-        build_skill_tools(actual_skill_registry)
+        build_skill_tools(actual_skill_registry, trace_recorder=trace_recorder)
         if actual_skill_registry is not None
         else []
     )
     tools = [retrieval_tool, *skill_tools, *(mcp_tools or [])]
     tool_map = build_tool_map(tools)
-    base_model = agent_model or ChatTongyi(model=DEFAULT_AGENT_MODEL, max_retries=0)
+    mcp_tool_names = {tool.name for tool in (mcp_tools or [])}
+
+    def tool_category(tool_name: str) -> str:
+        if tool_name == "search_product_knowledge":
+            return "rag"
+        if tool_name in {"load_skill", "read_skill_file"}:
+            return "skill"
+        if tool_name in mcp_tool_names:
+            return "mcp"
+        return "tool"
+
+    base_model = agent_model or ChatTongyi(model=agent_model_name, max_retries=0)
     model = base_model.bind_tools(tools)
+    reflection_agent = (
+        ReflectionAgent(
+            rag=rag,
+            model_name=agent_model_name,
+            model=base_model,
+            retry_policy=retry_policy,
+            trace_recorder=trace_recorder,
+        )
+        if reflection_enabled
+        else None
+    )
 
     system_prompt = SystemMessage(
         content=(
@@ -579,10 +864,15 @@ def build_agent(
         if explicit_skill_name is not None:
             update["active_skill_names"] = [explicit_skill_name]
         if trace_recorder is not None:
+            available_skills = actual_skill_registry.list_skills()
             trace_recorder.event(
                 "skill",
                 "agent.load_skills",
                 {
+                    "available_skill_count": len(available_skills),
+                    "available_skill_names": [
+                        skill.name for skill in available_skills
+                    ],
                     "explicit_skill_name": explicit_skill_name,
                     "skill_context_chars": len(update["skill_context"]),
                 },
@@ -650,8 +940,27 @@ def build_agent(
                     "content_preview": preview_text(
                         coerce_message_content(response.content)
                     ),
+                    **message_usage_metadata(response),
                 },
             )
+        if (
+            reflection_agent is not None
+            and isinstance(response, AIMessage)
+            and not response.tool_calls
+        ):
+            initial_answer = coerce_message_content(response.content).strip()
+            revised_answer = await reflection_agent.review_and_revise(
+                user_question=state.get("latest_user_message", "")
+                or latest_human_text(state.get("messages", [])),
+                initial_answer=initial_answer,
+                evidence_context=format_recent_tool_context(
+                    state.get("messages", [])
+                ),
+                memory_context=state.get("memory_context", ""),
+                skill_context=state.get("skill_context", ""),
+            )
+            if revised_answer != initial_answer:
+                response = replace_ai_message_content(response, revised_answer)
         return {"messages": [response]}
 
     def route_tools(state: AgentState) -> str:
@@ -765,6 +1074,7 @@ def build_agent(
                         "agent.tool_call_start",
                         {
                             "tool_name": selected_tool.name,
+                            "tool_category": tool_category(selected_tool.name),
                             "args": tool_call.get("args"),
                         },
                     )
@@ -775,6 +1085,7 @@ def build_agent(
                         "agent.tool_call_end",
                         {
                             "tool_name": selected_tool.name,
+                            "tool_category": tool_category(selected_tool.name),
                             "result_preview": preview_text(tool_result),
                         },
                     )
@@ -948,23 +1259,29 @@ def build_agent(
 async def run_cli_async(
     *,
     query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
+    agent_model_name: str = DEFAULT_AGENT_MODEL,
     rewrite_model_name: str = DEFAULT_AGENT_MODEL,
     bm25_enabled: bool = True,
-    cross_encoder_enabled: bool = True,
+    cross_encoder_enabled: bool = False,
     user_id: str = DEFAULT_USER_ID,
     memory_enabled: bool = True,
     memory_model_name: str = DEFAULT_AGENT_MODEL,
+    memory_top_k: int = 5,
     skills_enabled: bool = True,
     skill_dirs: list[str] | None = None,
     mcp_enabled: bool = False,
     mcp_config_path: str = DEFAULT_MCP_CONFIG_PATH,
     trace_enabled: bool = False,
+    live_events_enabled: bool = DEFAULT_LIVE_EVENTS_ENABLED,
     trace_dir: str = DEFAULT_TRACE_DIR,
+    data_dir: str = "data",
+    memory_dir: str = "memory",
     llm_retry_attempts: int = 3,
     llm_timeout_s: float | None = 30.0,
     llm_retry_backoff_s: float = 1.0,
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS,
+    reflection_enabled: bool = DEFAULT_REFLECTION_ENABLED,
 ) -> None:
     actual_query_rewrite_mode = normalize_query_rewrite_mode(query_rewrite_mode)
     llm_retry_policy = LLMRetryPolicy(
@@ -972,21 +1289,63 @@ async def run_cli_async(
         per_attempt_timeout_s=llm_timeout_s,
         initial_backoff_s=llm_retry_backoff_s,
     )
-    trace_recorder = (
-        TraceRecorder(
+    trace_recorder = None
+    if trace_enabled or live_events_enabled:
+        trace_recorder = TraceRecorder(
             trace_dir=trace_dir,
-            default_tags={"entrypoint": "cli", "user_id": user_id},
+            enabled=trace_enabled,
+            default_tags={
+                "entrypoint": "cli",
+                "user_id": user_id,
+                "agent_model": agent_model_name,
+            },
+            event_sinks=[
+                CLILiveEventPrinter(enabled=live_events_enabled),
+            ],
         )
-        if trace_enabled
-        else None
-    )
+    if trace_recorder is not None:
+        trace_recorder.event(
+            "runtime",
+            "cli.startup",
+            {
+                "query_rewrite_mode": actual_query_rewrite_mode,
+                "agent_model_name": agent_model_name,
+                "rewrite_model_name": rewrite_model_name,
+                "bm25_enabled": bm25_enabled,
+                "cross_encoder_enabled": cross_encoder_enabled,
+                "memory_enabled": memory_enabled,
+                "memory_model_name": memory_model_name,
+                "memory_top_k": memory_top_k,
+                "skills_enabled": skills_enabled,
+                "skill_dirs": skill_dirs or [],
+                "mcp_enabled": mcp_enabled,
+                "mcp_config_path": mcp_config_path,
+                "trace_dir": trace_dir,
+                "trace_enabled": trace_enabled,
+                "live_events_enabled": live_events_enabled,
+                "data_dir": data_dir,
+                "memory_dir": memory_dir,
+                "llm_retry_attempts": llm_retry_policy.normalized().max_attempts,
+                "llm_timeout_s": llm_retry_policy.normalized().per_attempt_timeout_s,
+                "llm_retry_backoff_s": (
+                    llm_retry_policy.normalized().initial_backoff_s
+                ),
+                "max_tool_rounds": max_tool_rounds,
+                "max_repeated_tool_calls": max_repeated_tool_calls,
+                "reflection_enabled": reflection_enabled,
+            },
+        )
     rag = RAGService(
-        data_dir="data",
+        data_dir=data_dir,
         default_use_bm25=bm25_enabled,
         default_use_rerank=cross_encoder_enabled,
         trace_recorder=trace_recorder,
     )
-    memory_service = MemoryService(data_dir="memory") if memory_enabled else None
+    memory_service = (
+        MemoryService(data_dir=memory_dir, trace_recorder=trace_recorder)
+        if memory_enabled
+        else None
+    )
     memory_extractor = (
         LLMMemoryExtractor(
             model_name=memory_model_name,
@@ -1010,12 +1369,24 @@ async def run_cli_async(
         else None
     )
     mcp_tools = mcp_result.tools if mcp_result is not None else []
+    if trace_recorder is not None and mcp_result is not None:
+        trace_recorder.event(
+            "mcp",
+            "mcp.load_tools",
+            {
+                "server_names": mcp_result.server_names,
+                "tool_names": [tool.name for tool in mcp_tools],
+                "tool_count": len(mcp_tools),
+            },
+        )
     app, model, system_prompt = build_agent(
         rag,
         query_rewrite_mode=actual_query_rewrite_mode,
+        agent_model_name=agent_model_name,
         rewrite_model_name=rewrite_model_name,
         memory_service=memory_service,
         memory_extractor=memory_extractor,
+        memory_top_k=memory_top_k,
         skills_enabled=skills_enabled,
         skill_registry=skill_registry,
         mcp_tools=mcp_tools,
@@ -1023,13 +1394,17 @@ async def run_cli_async(
         llm_retry_policy=llm_retry_policy,
         max_tool_rounds=max_tool_rounds,
         max_repeated_tool_calls=max_repeated_tool_calls,
+        reflection_enabled=reflection_enabled,
     )
     messages: list[BaseMessage] = []
 
     print("电商客服 Agent 已启动，输入 quit 或 exit 结束。")
+    print(f"当前 Agent 模型: {agent_model_name}")
     print(f"当前 query 改写模式: {actual_query_rewrite_mode}")
     print(f"当前 BM25 模式: {'on' if bm25_enabled else 'off'}")
     print(f"当前 CrossEncoder 精排模式: {'on' if cross_encoder_enabled else 'off'}")
+    print(f"当前 data_dir: {data_dir}")
+    print(f"当前 memory_dir: {memory_dir}")
     print(f"当前 memory 模式: {'on' if memory_enabled else 'off'}")
     print(
         "当前 LLM 重试策略: "
@@ -1042,10 +1417,12 @@ async def run_cli_async(
         f"max_tool_rounds={max_tool_rounds}, "
         f"max_repeated_tool_calls={max_repeated_tool_calls}"
     )
-    if trace_recorder is not None:
+    print(f"当前 Reflection 模式: {'on' if reflection_enabled else 'off'}")
+    if trace_enabled and trace_recorder is not None:
         print(f"当前 trace 模式: on ({trace_recorder.path})")
     else:
         print("当前 trace 模式: off")
+    print(f"当前 CLI 实时事件: {'on' if live_events_enabled else 'off'}")
     if skill_registry is not None:
         skills = skill_registry.list_skills()
         print(f"当前 skills 模式: on ({len(skills)} 个)")
@@ -1078,23 +1455,97 @@ async def run_cli_async(
                 continue
 
             input_messages = messages + [HumanMessage(content=user_input)]
+            turn_start = time.perf_counter()
+            if trace_recorder is not None:
+                trace_recorder.event(
+                    "agent",
+                    "agent.user_turn_start",
+                    {
+                        "user_id": user_id,
+                        "input_preview": preview_text(user_input),
+                        "history_message_count": len(messages),
+                    },
+                )
             try:
-                result = await app.ainvoke(
+                print("\n客服: ", end="", flush=True)
+                streamed_content = ""
+                final_message = None
+                result = None
+                async for event in app.astream(
                     {
                         "messages": input_messages,
                         "user_id": user_id,
-                    }
-                )
+                    },
+                    stream_mode="updates",
+                ):
+                    for node_name, node_output in event.items():
+                        node_messages = node_output.get("messages", [])
+                        for msg in node_messages:
+                            if not isinstance(msg, AIMessage):
+                                continue
+                            if msg.tool_calls:
+                                continue
+                            content = coerce_message_content(msg.content).strip()
+                            if content and content != streamed_content:
+                                new_text = content[len(streamed_content):]
+                                print(new_text, end="", flush=True)
+                                streamed_content = content
+                                final_message = msg
+                    result = node_output
+                print(flush=True)
             except Exception as error:
+                print(flush=True)
+                if trace_recorder is not None:
+                    trace_recorder.event(
+                        "agent",
+                        "agent.user_turn_error",
+                        {
+                            "user_id": user_id,
+                            "error": repr(error),
+                            "elapsed_ms": (
+                                time.perf_counter() - turn_start
+                            )
+                            * 1000,
+                        },
+                        level="error",
+                    )
                 model_messages = [system_prompt, *input_messages]
-                print(f"\n客服: {format_tongyi_error(model, model_messages, error)}")
+                print(f"客服: {format_tongyi_error(model, model_messages, error)}")
                 continue
 
-            messages = result["messages"]
+            if result and "messages" in result:
+                messages = result["messages"]
+            else:
+                messages = input_messages + (
+                    [final_message] if final_message else []
+                )
 
-            final_message = messages[-1]
+            if final_message is None:
+                last = messages[-1] if messages else None
+                if isinstance(last, AIMessage):
+                    final_message = last
+
             if isinstance(final_message, AIMessage):
-                print(f"\n客服: {final_message.content}")
+                if not streamed_content:
+                    content = coerce_message_content(final_message.content)
+                    print(content, flush=True)
+                if trace_recorder is not None:
+                    trace_recorder.event(
+                        "agent",
+                        "agent.user_turn_end",
+                        {
+                            "user_id": user_id,
+                            "elapsed_ms": (
+                                time.perf_counter() - turn_start
+                            )
+                            * 1000,
+                            "message_count": len(messages),
+                            "output_preview": preview_text(
+                                final_message.content
+                            ),
+                            **message_usage_metadata(final_message),
+                        },
+                    )
     finally:
         if memory_service is not None:
             memory_service.close()
@@ -1104,55 +1555,84 @@ def run_cli(**kwargs: Any) -> None:
     asyncio.run(run_cli_async(**kwargs))
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the ecommerce customer-service CLI.")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Optional .toml or .json config file. "
+            "RAG_SERVER_CONFIG is also supported."
+        ),
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="RAG index data directory. Overrides config/env when set.",
+    )
+    parser.add_argument(
+        "--memory-dir",
+        default=None,
+        help="Long-term memory data directory. Overrides config/env when set.",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="Model name used by the agent. Overrides config/env when set.",
+    )
     parser.add_argument(
         "--query-rewrite",
         choices=QUERY_REWRITE_MODES,
-        default=DEFAULT_QUERY_REWRITE_MODE,
+        default=None,
         help=(
             "Control retrieval query rewriting. "
-            "'on' is an alias for 'multi_query'. Defaults to on."
+            "'on' is an alias for 'multi_query'. Defaults to config value."
         ),
     )
     parser.add_argument(
         "--bm25",
         choices=["on", "off"],
-        default="on",
-        help="Enable or disable BM25 keyword retrieval. Defaults to on.",
+        default=None,
+        help="Enable or disable BM25 keyword retrieval. Defaults to config value.",
     )
     parser.add_argument(
         "--cross-encoder",
         choices=["on", "off"],
-        default="off",
-        help="Enable or disable CrossEncoder reranking. Defaults to off.",
+        default=None,
+        help="Enable or disable CrossEncoder reranking. Defaults to config value.",
     )
     parser.add_argument(
         "--rewrite-model",
-        default=DEFAULT_AGENT_MODEL,
+        default=None,
         help="Model name used by the query rewriter. Defaults to the agent model.",
     )
     parser.add_argument(
         "--user-id",
-        default=DEFAULT_USER_ID,
+        default=None,
         help="User id used to scope long-term memories.",
     )
     parser.add_argument(
         "--memory",
         choices=["on", "off"],
-        default="on",
-        help="Enable or disable long-term memory.",
+        default=None,
+        help="Enable or disable long-term memory. Defaults to config value.",
     )
     parser.add_argument(
         "--memory-model",
-        default=DEFAULT_AGENT_MODEL,
+        default=None,
         help="Model name used by the memory extractor. Defaults to the agent model.",
+    )
+    parser.add_argument(
+        "--memory-top-k",
+        type=int,
+        default=None,
+        help="Number of long-term memories loaded per profile layer.",
     )
     parser.add_argument(
         "--skills",
         choices=["on", "off"],
-        default="on",
-        help="Enable or disable Anthropic-style skills. Defaults to on.",
+        default=None,
+        help="Enable or disable Anthropic-style skills. Defaults to config value.",
     )
     parser.add_argument(
         "--skills-dir",
@@ -1166,38 +1646,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mcp",
         choices=["on", "off"],
-        default="off",
-        help="Enable or disable MCP client tools. Defaults to off.",
+        default=None,
+        help="Enable or disable MCP client tools. Defaults to config value.",
     )
     parser.add_argument(
         "--mcp-config",
-        default=DEFAULT_MCP_CONFIG_PATH,
+        default=None,
         help=(
             "Path to MCP server JSON config. "
-            f"Defaults to {DEFAULT_MCP_CONFIG_PATH}."
+            f"Default config value is {DEFAULT_MCP_CONFIG_PATH}."
         ),
     )
     parser.add_argument(
         "--trace",
         choices=["on", "off"],
-        default="off",
-        help="Enable or disable JSONL runtime tracing. Defaults to off.",
+        default=None,
+        help="Enable or disable JSONL runtime tracing. Defaults to config value.",
+    )
+    parser.add_argument(
+        "--live-events",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Show RAG, memory, skill, and MCP events live in the CLI. "
+            "Defaults to config value."
+        ),
     )
     parser.add_argument(
         "--trace-dir",
-        default=DEFAULT_TRACE_DIR,
+        default=None,
         help=f"Directory for JSONL trace files. Defaults to {DEFAULT_TRACE_DIR}.",
     )
     parser.add_argument(
         "--llm-retry-attempts",
         type=int,
-        default=3,
+        default=None,
         help="Maximum attempts for each LLM call. Defaults to 3.",
     )
     parser.add_argument(
         "--llm-timeout",
         type=float,
-        default=30.0,
+        default=None,
         help=(
             "Per-attempt LLM timeout in seconds. "
             "Use 0 or a negative value to disable timeout. Defaults to 30."
@@ -1206,13 +1695,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-retry-backoff",
         type=float,
-        default=1.0,
+        default=None,
         help="Initial retry backoff in seconds. Defaults to 1.",
     )
     parser.add_argument(
         "--max-tool-rounds",
         type=int,
-        default=DEFAULT_MAX_TOOL_ROUNDS,
+        default=None,
         help=(
             "Maximum Agent tool-call rounds per user turn. "
             f"Defaults to {DEFAULT_MAX_TOOL_ROUNDS}."
@@ -1221,37 +1710,102 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-repeated-tool-calls",
         type=int,
-        default=DEFAULT_MAX_REPEATED_TOOL_CALLS,
+        default=None,
         help=(
             "Maximum repeated identical tool-call rounds per user turn. "
             f"Defaults to {DEFAULT_MAX_REPEATED_TOOL_CALLS}."
         ),
     )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    run_cli(
-        query_rewrite_mode=args.query_rewrite,
-        rewrite_model_name=args.rewrite_model,
-        bm25_enabled=args.bm25 == "on",
-        cross_encoder_enabled=args.cross_encoder == "on",
-        user_id=args.user_id,
-        memory_enabled=args.memory == "on",
-        memory_model_name=args.memory_model,
-        skills_enabled=args.skills == "on",
-        skill_dirs=args.skills_dir,
-        mcp_enabled=args.mcp == "on",
-        mcp_config_path=args.mcp_config,
-        trace_enabled=args.trace == "on",
-        trace_dir=args.trace_dir,
-        llm_retry_attempts=args.llm_retry_attempts,
-        llm_timeout_s=args.llm_timeout if args.llm_timeout > 0 else None,
-        llm_retry_backoff_s=args.llm_retry_backoff,
-        max_tool_rounds=args.max_tool_rounds,
-        max_repeated_tool_calls=args.max_repeated_tool_calls,
+    parser.add_argument(
+        "--reflection",
+        choices=["on", "off"],
+        default=None,
+        help="Enable or disable post-answer reflection and correction.",
     )
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
+
+
+def _put_override(
+    overrides: dict[str, dict[str, Any]],
+    section: str,
+    key: str,
+    value: Any,
+) -> None:
+    if value is None:
+        return
+    overrides.setdefault(section, {})[key] = value
+
+
+def build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, dict[str, Any]] = {}
+    _put_override(overrides, "paths", "data_dir", args.data_dir)
+    _put_override(overrides, "paths", "memory_dir", args.memory_dir)
+    _put_override(overrides, "paths", "trace_dir", args.trace_dir)
+    _put_override(overrides, "paths", "mcp_config_path", args.mcp_config)
+    _put_override(overrides, "agent", "model", args.agent_model)
+    _put_override(overrides, "agent", "user_id", args.user_id)
+    _put_override(overrides, "agent", "max_tool_rounds", args.max_tool_rounds)
+    _put_override(
+        overrides,
+        "agent",
+        "max_repeated_tool_calls",
+        args.max_repeated_tool_calls,
+    )
+    if args.reflection is not None:
+        _put_override(
+            overrides,
+            "agent",
+            "reflection_enabled",
+            args.reflection == "on",
+        )
+    _put_override(overrides, "retrieval", "query_rewrite", args.query_rewrite)
+    if args.bm25 is not None:
+        _put_override(overrides, "retrieval", "bm25", args.bm25 == "on")
+    if args.cross_encoder is not None:
+        _put_override(
+            overrides,
+            "retrieval",
+            "cross_encoder",
+            args.cross_encoder == "on",
+        )
+    _put_override(overrides, "llm", "rewrite_model", args.rewrite_model)
+    _put_override(overrides, "llm", "memory_model", args.memory_model)
+    _put_override(overrides, "llm", "retry_attempts", args.llm_retry_attempts)
+    if args.llm_timeout is not None:
+        overrides.setdefault("llm", {})["timeout_s"] = (
+            args.llm_timeout if args.llm_timeout > 0 else None
+        )
+    _put_override(overrides, "llm", "retry_backoff_s", args.llm_retry_backoff)
+    if args.memory is not None:
+        _put_override(overrides, "memory", "enabled", args.memory == "on")
+    _put_override(overrides, "memory", "top_k", args.memory_top_k)
+    if args.skills is not None:
+        _put_override(overrides, "skills", "enabled", args.skills == "on")
+    _put_override(overrides, "skills", "dirs", args.skills_dir)
+    if args.mcp is not None:
+        _put_override(overrides, "mcp", "enabled", args.mcp == "on")
+    if args.trace is not None:
+        _put_override(overrides, "trace", "enabled", args.trace == "on")
+    if args.live_events is not None:
+        _put_override(overrides, "trace", "live", args.live_events == "on")
+    return overrides
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    try:
+        config = load_app_config(
+            args.config,
+            overrides=build_cli_overrides(args),
+        )
+    except ConfigError as error:
+        raise SystemExit(f"配置错误: {error}") from error
+
+    run_cli(**config.to_runtime_kwargs())
 
 
 if __name__ == "__main__":

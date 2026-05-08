@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from .llm_retry import LLMRetryPolicy, invoke_with_retry
 from .rag_service import RAGService
 from .trace_service import TraceRecorder, summarize_result
+from .utils import coerce_message_content, parse_json_object
 
 
 @dataclass
@@ -66,8 +67,8 @@ class LLMQueryRewriter:
             operation="query_rewrite.invoke",
             on_failure=self._trace_retry_failure,
         )
-        raw_response = self._coerce_content(response.content)
-        payload = self._parse_payload(raw_response)
+        raw_response = coerce_message_content(response.content)
+        payload = parse_json_object(raw_response)
 
         rewritten_query = str(payload.get("rewritten_query") or query).strip() or query
         search_queries = self._normalize_queries(payload.get("search_queries"), query)
@@ -106,35 +107,6 @@ class LLMQueryRewriter:
             {"model_name": self.model_name, **event},
             level="warning" if event.get("will_retry") else "error",
         )
-
-    def _coerce_content(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict) and item.get("text"):
-                    parts.append(str(item["text"]))
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts)
-        return str(content)
-
-    def _parse_payload(self, raw_response: str) -> dict[str, Any]:
-        candidates = [raw_response]
-        start = raw_response.find("{")
-        end = raw_response.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidates.insert(0, raw_response[start : end + 1])
-
-        for candidate in candidates:
-            try:
-                payload = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                return payload
-        return {}
 
     def _normalize_queries(self, value: Any, original_query: str) -> list[str]:
         if not isinstance(value, list):

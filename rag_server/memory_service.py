@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .llm_retry import LLMRetryPolicy, invoke_with_retry
+from .utils import coerce_message_content, parse_json_object
 
 MEMORY_TYPES = {
     "profile",
@@ -72,6 +74,7 @@ class MemoryService:
         data_dir: str = "memory",
         model_name: str = "text-embedding-v4",
         embeddings: Any | None = None,
+        trace_recorder: Any | None = None,
     ) -> None:
         self.base_dir = Path(data_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +83,7 @@ class MemoryService:
         self.index_dir = self.base_dir / "indexes"
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.embeddings = embeddings or DashScopeEmbeddings(model=model_name)
+        self.trace_recorder = trace_recorder
         self._index_cache: dict[str, tuple[faiss.Index | None, list[str]]] = {}
 
         self.conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
@@ -206,6 +210,7 @@ class MemoryService:
         limit: int = 50,
         include_expired: bool = False,
     ) -> list[dict]:
+        start = time.perf_counter()
         where = ["user_id = ?", "deleted_at IS NULL"]
         params: list[Any] = [user_id]
         if not include_expired:
@@ -221,7 +226,18 @@ class MemoryService:
             """,
             [*params, max(1, limit)],
         ).fetchall()
-        return [self._row_to_record(row) for row in rows]
+        results = [self._row_to_record(row) for row in rows]
+        self._trace_event(
+            "memory.list_memories",
+            {
+                "user_id": user_id,
+                "limit": limit,
+                "include_expired": include_expired,
+                "result_count": len(results),
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+            },
+        )
+        return results
 
     def search_memory(
         self,
@@ -233,12 +249,33 @@ class MemoryService:
         memory_types: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
         """Semantic search over active memories for one user."""
+        start = time.perf_counter()
+        allowed_types = self._normalize_memory_types(memory_types)
         if top_k <= 0 or not query.strip():
+            self._trace_search_memory(
+                user_id=user_id,
+                query=query,
+                top_k=top_k,
+                min_score=min_score,
+                allowed_types=allowed_types,
+                result_count=0,
+                elapsed_ms=(time.perf_counter() - start) * 1000,
+                reason="empty_query_or_top_k",
+            )
             return []
 
-        allowed_types = self._normalize_memory_types(memory_types)
         index, index_ids = self._get_user_index(user_id)
         if index is None or index.ntotal == 0:
+            self._trace_search_memory(
+                user_id=user_id,
+                query=query,
+                top_k=top_k,
+                min_score=min_score,
+                allowed_types=allowed_types,
+                result_count=0,
+                elapsed_ms=(time.perf_counter() - start) * 1000,
+                reason="empty_index",
+            )
             return []
 
         limit = min(index.ntotal, max(top_k * 50, 100))
@@ -274,6 +311,24 @@ class MemoryService:
                 break
 
         results.sort(key=lambda item: item["score"], reverse=True)
+        self._trace_search_memory(
+            user_id=user_id,
+            query=query,
+            top_k=top_k,
+            min_score=min_score,
+            allowed_types=allowed_types,
+            result_count=len(results),
+            elapsed_ms=(time.perf_counter() - start) * 1000,
+            results=[
+                {
+                    "id": item["id"][:8],
+                    "memory_type": item["memory_type"],
+                    "memory_layer": item.get("memory_layer"),
+                    "score": item.get("score"),
+                }
+                for item in results
+            ],
+        )
         return results
 
     def search_memory_layer(
@@ -306,6 +361,7 @@ class MemoryService:
         min_score: float = 0.0,
     ) -> dict[str, list[dict]]:
         """Search profile, episode, and procedure memories separately."""
+        start = time.perf_counter()
         limits = {**DEFAULT_MEMORY_LAYER_TOP_K, **(layer_top_k or {})}
         layered: dict[str, list[dict]] = {}
         for layer in MEMORY_LAYERS:
@@ -316,6 +372,19 @@ class MemoryService:
                 top_k=limits.get(layer, 3),
                 min_score=min_score,
             )
+        self._trace_event(
+            "memory.search_memory_layers",
+            {
+                "user_id": user_id,
+                "query": query,
+                "layer_top_k": limits,
+                "min_score": min_score,
+                "layer_counts": {
+                    layer: len(items) for layer, items in layered.items()
+                },
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+            },
+        )
         return layered
 
     def forget_memory(self, memory_id: str, user_id: str | None = None) -> bool:
@@ -360,6 +429,45 @@ class MemoryService:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _trace_event(
+        self,
+        name: str,
+        payload: dict[str, Any],
+        *,
+        level: str = "info",
+    ) -> None:
+        if self.trace_recorder is None:
+            return
+        self.trace_recorder.event("memory", name, payload, level=level)
+
+    def _trace_search_memory(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        top_k: int,
+        min_score: float,
+        allowed_types: set[str] | None,
+        result_count: int,
+        elapsed_ms: float,
+        reason: str | None = None,
+        results: list[dict] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "user_id": user_id,
+            "query": query,
+            "top_k": top_k,
+            "min_score": min_score,
+            "memory_types": sorted(allowed_types) if allowed_types else None,
+            "result_count": result_count,
+            "elapsed_ms": elapsed_ms,
+        }
+        if reason:
+            payload["reason"] = reason
+        if results is not None:
+            payload["results"] = results
+        self._trace_event("memory.search_memory", payload)
 
     def _init_db(self) -> None:
         with self.conn:
@@ -616,7 +724,7 @@ class LLMMemoryExtractor:
             operation="memory_extractor.invoke",
             on_failure=self._trace_retry_failure,
         )
-        payload = self._parse_payload(self._coerce_content(response.content))
+        payload = parse_json_object(coerce_message_content(response.content))
         return self._normalize_memories(payload.get("memories"))
 
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
@@ -633,35 +741,6 @@ class LLMMemoryExtractor:
         if not memories:
             return "无"
         return "\n".join(f"- {item['content']}" for item in memories[:8])
-
-    def _coerce_content(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict) and item.get("text"):
-                    parts.append(str(item["text"]))
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts)
-        return str(content)
-
-    def _parse_payload(self, raw_response: str) -> dict[str, Any]:
-        candidates = [raw_response]
-        start = raw_response.find("{")
-        end = raw_response.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidates.insert(0, raw_response[start : end + 1])
-
-        for candidate in candidates:
-            try:
-                payload = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                return payload
-        return {}
 
     def _normalize_memories(self, value: Any) -> list[ExtractedMemory]:
         if not isinstance(value, list):

@@ -7,6 +7,8 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from .trace_service import preview_text
+
 ANTHROPIC_SKILL_FILENAME = "SKILL.md"
 DEFAULT_PROJECT_SKILLS_DIR = ".claude/skills"
 MAX_SKILL_FILE_BYTES = 30_000
@@ -263,18 +265,45 @@ class SkillRegistry:
         )
 
 
-def build_skill_tools(skill_registry: SkillRegistry):
+def build_skill_tools(
+    skill_registry: SkillRegistry,
+    *,
+    trace_recorder: Any | None = None,
+):
     """Expose Anthropic-style progressive skill loading as LangChain tools."""
 
     @tool(description="按名称加载一个 Anthropic-style skill 的完整 SKILL.md 指令。")
     def load_skill(name: str) -> str:
         """Load the full SKILL.md instructions for an available skill."""
-        return skill_registry.load_skill(name)
+        result = skill_registry.load_skill(name)
+        if trace_recorder is not None:
+            trace_recorder.event(
+                "skill",
+                "skill.load_skill",
+                {
+                    "name": name,
+                    "skill_name": str(name).strip().lower(),
+                    "result_preview": preview_text(result),
+                },
+            )
+        return result
 
     @tool(description="读取已加载 skill 目录下的支撑文件，relative_path 必须是相对路径。")
     def read_skill_file(name: str, relative_path: str) -> str:
         """Read a supporting file from a skill directory."""
-        return skill_registry.read_supporting_file(name, relative_path)
+        result = skill_registry.read_supporting_file(name, relative_path)
+        if trace_recorder is not None:
+            trace_recorder.event(
+                "skill",
+                "skill.read_skill_file",
+                {
+                    "name": name,
+                    "skill_name": str(name).strip().lower(),
+                    "relative_path": relative_path,
+                    "result_preview": preview_text(result),
+                },
+            )
+        return result
 
     return [load_skill, read_skill_file]
 

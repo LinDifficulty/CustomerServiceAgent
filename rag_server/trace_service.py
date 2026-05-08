@@ -3,14 +3,26 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 DEFAULT_TRACE_DIR = "traces"
 MAX_PREVIEW_CHARS = 300
+REDACTED_VALUE = "[redacted]"
+DEFAULT_REDACT_KEYS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 
 def _utc_now() -> str:
@@ -29,6 +41,26 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _should_redact_key(key: str, redact_keys: tuple[str, ...]) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(item in normalized for item in redact_keys)
+
+
+def _redact_sensitive(value: Any, redact_keys: tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            text_key = str(key)
+            if _should_redact_key(text_key, redact_keys):
+                result[text_key] = REDACTED_VALUE
+            else:
+                result[text_key] = _redact_sensitive(item, redact_keys)
+        return result
+    if isinstance(value, list | tuple | set):
+        return [_redact_sensitive(item, redact_keys) for item in value]
+    return value
+
+
 def preview_text(text: Any, max_chars: int = MAX_PREVIEW_CHARS) -> str:
     value = str(text)
     if len(value) <= max_chars:
@@ -43,6 +75,8 @@ def summarize_result(item: dict, *, include_content: bool = False) -> dict:
         "bm25_score": item.get("bm25_score"),
         "hybrid_score": item.get("hybrid_score"),
         "rerank_score": item.get("rerank_score"),
+        "multi_vector_scores": item.get("multi_vector_scores"),
+        "best_vector_type": item.get("best_vector_type"),
         "source": item.get("source"),
         "doc_id": item.get("doc_id") or item.get("metadata", {}).get("doc_id"),
         "chunk_index": item.get("metadata", {}).get("chunk_index"),
@@ -62,11 +96,14 @@ class TraceRecorder:
     run_id: str | None = None
     enabled: bool = True
     default_tags: dict[str, Any] = field(default_factory=dict)
+    redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS
+    event_sinks: list[Callable[[dict[str, Any]], None]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.run_id = self.run_id or uuid.uuid4().hex
         self.trace_dir = Path(self.trace_dir)
         self.path = self.trace_dir / f"{self.run_id}.jsonl"
+        self.redact_keys = tuple(item.lower() for item in self.redact_keys)
         if self.enabled:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -91,11 +128,31 @@ class TraceRecorder:
             "parent_id": parent_id,
             "span_id": span_id,
             "elapsed_ms": elapsed_ms,
-            "tags": self.default_tags,
-            "payload": payload or {},
+            "tags": _redact_sensitive(self.default_tags, self.redact_keys),
+            "payload": _redact_sensitive(payload or {}, self.redact_keys),
         }
         self.write(record)
+        self._notify_sinks(record)
         return record
+
+    def metric(
+        self,
+        name: str,
+        value: int | float,
+        *,
+        unit: str = "",
+        tags: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> dict:
+        metric_payload = {
+            "metric_name": name,
+            "value": float(value),
+            "unit": unit,
+            "metric_tags": tags or {},
+            **(payload or {}),
+        }
+        return self.event("metric", name, metric_payload, level=level)
 
     @contextmanager
     def span(
@@ -145,6 +202,17 @@ class TraceRecorder:
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(_json_safe(record), ensure_ascii=False) + "\n")
 
+    def add_sink(self, sink: Callable[[dict[str, Any]], None]) -> None:
+        self.event_sinks.append(sink)
+
+    def _notify_sinks(self, record: dict[str, Any]) -> None:
+        for sink in self.event_sinks:
+            try:
+                sink(record)
+            except Exception:
+                # Observability sinks must never break the main user flow.
+                continue
+
 
 def load_trace(path: str | Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
@@ -161,3 +229,31 @@ def load_trace(path: str | Path) -> list[dict[str, Any]]:
         if isinstance(record, dict):
             records.append(record)
     return records
+
+
+def summarize_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a compact operational summary from JSONL trace records."""
+    levels = Counter(str(item.get("level") or "info") for item in records)
+    event_types = Counter(str(item.get("type") or "") for item in records)
+    names = Counter(str(item.get("name") or "") for item in records)
+    elapsed_values = [
+        float(item["elapsed_ms"])
+        for item in records
+        if isinstance(item.get("elapsed_ms"), int | float)
+    ]
+    timestamps = [
+        str(item.get("timestamp"))
+        for item in records
+        if item.get("timestamp")
+    ]
+    return {
+        "event_count": len(records),
+        "levels": dict(sorted(levels.items())),
+        "event_types": dict(sorted(event_types.items())),
+        "top_names": dict(names.most_common(10)),
+        "warning_count": levels.get("warning", 0),
+        "error_count": levels.get("error", 0),
+        "elapsed_ms_total": sum(elapsed_values),
+        "first_timestamp": min(timestamps) if timestamps else None,
+        "last_timestamp": max(timestamps) if timestamps else None,
+    }

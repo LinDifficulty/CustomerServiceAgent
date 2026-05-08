@@ -5,7 +5,7 @@ import json
 
 from .eval_service import evaluate_retrieval_dataset, write_eval_report
 from .rag_service import RAGService
-from .trace_service import DEFAULT_TRACE_DIR, TraceRecorder
+from .trace_service import DEFAULT_TRACE_DIR, TraceRecorder, load_trace, summarize_trace
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +60,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TRACE_DIR,
         help=f"Directory for JSONL trace files. Defaults to {DEFAULT_TRACE_DIR}.",
     )
+    parser.add_argument(
+        "--min-hit-rate",
+        type=float,
+        default=None,
+        help="Fail the eval run if hit_rate is below this value.",
+    )
+    parser.add_argument(
+        "--min-mrr",
+        type=float,
+        default=None,
+        help="Fail the eval run if mrr is below this value.",
+    )
     return parser.parse_args()
 
 
@@ -94,8 +106,29 @@ def main() -> None:
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
     if trace_recorder is not None:
         print(f"trace: {trace_recorder.path}")
+        print(
+            "trace_summary: "
+            + json.dumps(
+                summarize_trace(load_trace(trace_recorder.path)),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
     if args.output:
         print(f"report: {args.output}")
+
+    failures = []
+    if (
+        args.min_hit_rate is not None
+        and report["summary"]["hit_rate"] < args.min_hit_rate
+    ):
+        failures.append(
+            f"hit_rate {report['summary']['hit_rate']:.4f} < {args.min_hit_rate:.4f}"
+        )
+    if args.min_mrr is not None and report["summary"]["mrr"] < args.min_mrr:
+        failures.append(f"mrr {report['summary']['mrr']:.4f} < {args.min_mrr:.4f}")
+    if failures:
+        raise SystemExit("Eval failed: " + "; ".join(failures))
 
 
 if __name__ == "__main__":

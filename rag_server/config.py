@@ -29,6 +29,7 @@ DEFAULT_TRACE_DIR = "traces"
 DEFAULT_MCP_CONFIG_PATH = "mcp_servers.json"
 DEFAULT_LIVE_EVENTS_ENABLED = False
 DEFAULT_CLI_CONFIG_OUTPUT_ENABLED = False
+DEFAULT_STREAM_OUTPUT_ENABLED = True
 DEFAULT_CACHE_ENABLED = False
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 DEFAULT_CACHE_NAMESPACE = "rag-server"
@@ -117,6 +118,7 @@ class TraceSettings:
 @dataclass(frozen=True)
 class CLISettings:
     show_config: bool = DEFAULT_CLI_CONFIG_OUTPUT_ENABLED
+    stream_output: bool = DEFAULT_STREAM_OUTPUT_ENABLED
 
 
 @dataclass(frozen=True)
@@ -225,6 +227,7 @@ class AppConfig:
             "live_events_enabled": self.trace.live,
             "trace_dir": self.paths.trace_dir,
             "show_config": self.cli.show_config,
+            "stream_output_enabled": self.cli.stream_output,
             "llm_retry_attempts": self.llm.retry_attempts,
             "llm_timeout_s": self.llm.timeout_s,
             "llm_retry_backoff_s": self.llm.retry_backoff_s,
@@ -364,6 +367,8 @@ def build_env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
         "RAG_SERVER_SHOW_CONFIG": ("cli", "show_config"),
         "RAG_SERVER_CLI_SHOW_CONFIG": ("cli", "show_config"),
         "RAG_SERVER_CLI_CONFIG_OUTPUT": ("cli", "show_config"),
+        "RAG_SERVER_STREAM_OUTPUT": ("cli", "stream_output"),
+        "RAG_SERVER_CLI_STREAM_OUTPUT": ("cli", "stream_output"),
         "RAG_SERVER_CACHE": ("cache", "enabled"),
         "RAG_SERVER_CACHE_ENABLED": ("cache", "enabled"),
         "RAG_SERVER_REDIS_URL": ("cache", "redis_url"),
@@ -620,12 +625,16 @@ def _trace_settings(raw: Any) -> TraceSettings:
 
 def _cli_settings(raw: Any) -> CLISettings:
     section = _section(raw, "cli")
-    _ensure_known_keys("cli", section, {"show_config"})
+    _ensure_known_keys("cli", section, {"show_config", "stream_output"})
     default = CLISettings()
     return CLISettings(
         show_config=_coerce_bool(
             section.get("show_config", default.show_config),
             "cli.show_config",
+        ),
+        stream_output=_coerce_bool(
+            section.get("stream_output", default.stream_output),
+            "cli.stream_output",
         ),
     )
 
@@ -724,6 +733,8 @@ def _normalize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         ("cli", "startup_config"): ("cli", "show_config"),
         ("cli", "show_startup_config"): ("cli", "show_config"),
         ("cli", "config_output"): ("cli", "show_config"),
+        ("cli", "streaming"): ("cli", "stream_output"),
+        ("cli", "stream_output_enabled"): ("cli", "stream_output"),
         ("cli", "live_events"): ("trace", "live"),
         ("cli", "live_logs"): ("trace", "live"),
         ("cache", "url"): ("cache", "redis_url"),

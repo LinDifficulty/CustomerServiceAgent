@@ -7,7 +7,7 @@ import json
 from typing import Any, Callable
 
 DEFAULT_CHAT_PROVIDER = "tongyi"
-DEFAULT_CHAT_MODEL = "qwen3-max-2026-01-23"
+DEFAULT_CHAT_MODEL = "deepseek-v4-flash"
 DEFAULT_EMBEDDING_PROVIDER = "dashscope"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_RERANKER_PROVIDER = "cross_encoder"

@@ -44,6 +44,8 @@ class CLIConfigTests(unittest.TestCase):
                 "off",
                 "--show-config",
                 "off",
+                "--stream-output",
+                "off",
                 "--llm-timeout",
                 "0",
                 "--memory-top-k",
@@ -80,6 +82,7 @@ class CLIConfigTests(unittest.TestCase):
         self.assertTrue(overrides["trace"]["enabled"])
         self.assertFalse(overrides["trace"]["live"])
         self.assertFalse(overrides["cli"]["show_config"])
+        self.assertFalse(overrides["cli"]["stream_output"])
         self.assertIsNone(overrides["llm"]["timeout_s"])
         self.assertEqual(overrides["memory"]["top_k"], 9)
         self.assertFalse(overrides["agent"]["reflection_enabled"])

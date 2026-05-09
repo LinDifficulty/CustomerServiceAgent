@@ -137,6 +137,7 @@ uv run rag-cli --cache on --redis-url redis://localhost:6379/0
 - `--trace on|off`
 - `--live-events on|off`
 - `--show-config on|off`
+- `--stream-output on|off`
 
 CLI 内置命令：
 
@@ -217,6 +218,8 @@ uv run rag-cli --trace on --trace-dir traces
 ```
 
 追踪输出为 JSONL，会记录 RAG、查询改写、反思、智能体、记忆、技能、MCP 和评测等事件，并自动脱敏常见敏感键名。
+
+CLI 默认开启回答流式输出。需要关闭时使用 `--stream-output off`，或设置 `RAG_SERVER_STREAM_OUTPUT=off`。
 
 ### 检索评测
 

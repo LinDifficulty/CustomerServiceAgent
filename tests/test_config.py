@@ -13,8 +13,10 @@ class AppConfigTests(unittest.TestCase):
 
         self.assertFalse(config.trace.live)
         self.assertFalse(config.cli.show_config)
+        self.assertTrue(config.cli.stream_output)
         self.assertFalse(config.to_runtime_kwargs()["live_events_enabled"])
         self.assertFalse(config.to_runtime_kwargs()["show_config"])
+        self.assertTrue(config.to_runtime_kwargs()["stream_output_enabled"])
 
     def test_loads_defaults_file_env_and_overrides_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -57,6 +59,7 @@ class AppConfigTests(unittest.TestCase):
                     "RAG_SERVER_BM25": "on",
                     "RAG_SERVER_LIVE_EVENTS": "off",
                     "RAG_SERVER_CLI_SHOW_CONFIG": "off",
+                    "RAG_SERVER_STREAM_OUTPUT": "off",
                 },
                 overrides={
                     "paths": {"memory_dir": "from_cli_memory"},
@@ -77,6 +80,7 @@ class AppConfigTests(unittest.TestCase):
             self.assertTrue(config.trace.enabled)
             self.assertFalse(config.trace.live)
             self.assertFalse(config.cli.show_config)
+            self.assertFalse(config.cli.stream_output)
             self.assertFalse(config.cache.enabled)
 
             runtime = config.to_runtime_kwargs()
@@ -90,6 +94,7 @@ class AppConfigTests(unittest.TestCase):
             self.assertTrue(runtime["reflection_enabled"])
             self.assertFalse(runtime["live_events_enabled"])
             self.assertFalse(runtime["show_config"])
+            self.assertFalse(runtime["stream_output_enabled"])
             self.assertFalse(runtime["cache_enabled"])
 
     def test_rejects_unknown_keys(self) -> None:
@@ -114,7 +119,7 @@ class AppConfigTests(unittest.TestCase):
                 },
                 "memory": {"memory_top_k": 7},
                 "trace": {"live_events": False},
-                "cli": {"show_startup_config": False},
+                "cli": {"show_startup_config": False, "streaming": False},
             }
         )
 
@@ -126,6 +131,7 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(config.memory.top_k, 7)
         self.assertFalse(config.trace.live)
         self.assertFalse(config.cli.show_config)
+        self.assertFalse(config.cli.stream_output)
 
     def test_rewrite_model_inherits_agent_kwargs_when_provider_inherits(self) -> None:
         config = load_app_config(

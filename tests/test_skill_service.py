@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rag_server.skill_service import (
     SkillRegistry,
+    build_skill_tools,
     _parse_frontmatter,
     _safe_child_path,
     _validate_skill_metadata,
@@ -137,6 +138,19 @@ class SkillRegistryTests(unittest.TestCase):
             registry = SkillRegistry(skill_dirs=[str(skills_dir)])
             result = registry.read_supporting_file("my-skill", "SKILL.md")
 
+        self.assertIn("load_skill", result)
+
+    def test_read_skill_file_tool_handles_missing_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_dir = Path(temp_dir) / "skills"
+            _write_skill(skills_dir, "my-skill", "Test skill")
+            (skills_dir / "my-skill" / "info.txt").write_text("hello world")
+            registry = SkillRegistry(skill_dirs=[str(skills_dir)])
+            tools = {tool.name: tool for tool in build_skill_tools(registry)}
+            result = tools["read_skill_file"].invoke({"name": "my-skill"})
+
+        self.assertIn("缺少 relative_path", result)
+        self.assertIn("info.txt", result)
         self.assertIn("load_skill", result)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import inspect
 import os
 import json
 import re
@@ -12,7 +13,9 @@ import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Callable, TypedDict
+
+from pydantic import ValidationError
 
 try:
     import readline as _readline
@@ -32,12 +35,14 @@ except ImportError:  # pragma: no cover - optional interactive enhancement.
 
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
     convert_to_messages,
 )
+from langchain_core.messages.utils import message_chunk_to_message
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -46,6 +51,7 @@ from .cache_service import JsonCache, create_redis_cache
 from .config import (
     DEFAULT_CLI_CONFIG_OUTPUT_ENABLED,
     DEFAULT_LIVE_EVENTS_ENABLED,
+    DEFAULT_STREAM_OUTPUT_ENABLED,
     ConfigError,
     load_app_config,
 )
@@ -476,6 +482,79 @@ def replace_ai_message_content(message: AIMessage, content: str) -> AIMessage:
             return AIMessage(content=content)
 
 
+def add_ai_message_chunks(chunks: list[AIMessageChunk]) -> AIMessageChunk | None:
+    merged: AIMessageChunk | None = None
+    for chunk in chunks:
+        if merged is None:
+            merged = chunk
+        else:
+            merged = merged + chunk
+    return merged
+
+
+def ai_message_from_chunks(chunks: list[AIMessageChunk]) -> AIMessage:
+    merged = add_ai_message_chunks(chunks)
+    if merged is None:
+        return AIMessage(content="")
+    message = message_chunk_to_message(merged)
+    if isinstance(message, AIMessage):
+        return message
+    return AIMessage(content=coerce_message_content(message.content))
+
+
+def model_with_streaming_enabled(model: Any) -> Any:
+    if getattr(model, "streaming", None) is True:
+        return model
+    for method_name in ("model_copy", "copy"):
+        method = getattr(model, method_name, None)
+        if method is None:
+            continue
+        try:
+            return method(update={"streaming": True})
+        except Exception:
+            continue
+    try:
+        setattr(model, "streaming", True)
+    except Exception:
+        return model
+    return model
+
+
+async def maybe_emit_output_delta(
+    sink: Callable[[str], Any] | None,
+    text: str,
+) -> None:
+    if sink is None or not text:
+        return
+    result = sink(text)
+    if inspect.isawaitable(result):
+        await result
+
+
+class OutputDeltaDispatcher:
+    def __init__(self) -> None:
+        self.sink: Callable[[str], Any] | None = None
+
+    async def __call__(self, text: str) -> None:
+        await maybe_emit_output_delta(self.sink, text)
+
+
+def format_tool_validation_error(
+    tool_name: str,
+    error: ValidationError,
+    args: Any,
+) -> str:
+    if tool_name == "read_skill_file":
+        return (
+            "工具参数错误：read_skill_file 需要同时提供 name 和 relative_path。"
+            "如果只是要读取 skill 的完整 SKILL.md，请改用 load_skill(name)。"
+            "只有在 load_skill 返回的 Supporting files 列表中看到额外文件时，"
+            "才调用 read_skill_file(name, relative_path)。"
+            f"本次收到的参数: {args!r}。原始错误: {error}"
+        )
+    return f"工具参数错误：{tool_name} 收到的参数不符合 schema: {args!r}。原始错误: {error}"
+
+
 def message_usage_metadata(message: BaseMessage) -> dict[str, Any]:
     """Extract provider token usage without depending on one provider schema."""
     usage: dict[str, Any] = {}
@@ -708,6 +787,59 @@ class CLILiveEventPrinter:
                 print(line, flush=True)
 
 
+class CLIStatusEventSink:
+    """Drive the compact thinking status from actual runtime events."""
+
+    def __init__(self, view: "CLIView") -> None:
+        self.view = view
+
+    def __call__(self, record: dict[str, Any]) -> None:
+        indicator = self.view._thinking_indicator
+        if indicator is None or not indicator.active:
+            return
+        status = self.status_for_record(record)
+        if status:
+            indicator.update(status)
+
+    @staticmethod
+    def status_for_record(record: dict[str, Any]) -> str:
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        event_type = str(record.get("type") or "")
+        name = str(record.get("name") or "")
+
+        if (
+            event_type == "tool"
+            and name == "agent.tool_call_start"
+            and payload.get("tool_category") == "rag"
+        ):
+            return "正在检索相关知识..."
+
+        if (
+            event_type == "tool"
+            and name == "tool.search_product_knowledge"
+        ):
+            result_count = payload.get("result_count")
+            if isinstance(result_count, int | float) and result_count > 0:
+                return "找到相关知识..."
+            if result_count == 0:
+                return "未找到相关知识，继续直接回答..."
+
+        if event_type in {"rag", "retrieval"}:
+            result_count = payload.get("result_count")
+            candidate_count = payload.get("candidate_count")
+            if isinstance(result_count, int | float) and result_count > 0:
+                return "找到相关知识..."
+            if (
+                result_count == 0
+                and (candidate_count is None or candidate_count == 0)
+            ):
+                return "未找到相关知识，继续直接回答..."
+
+        return ""
+
+
 def builtin_slash_command_specs() -> list[SlashCommandSpec]:
     return list(BUILTIN_SLASH_COMMANDS)
 
@@ -889,6 +1021,7 @@ class CLIInputSession:
         slash_commands: list[SlashCommandSpec],
         readline_module: Any | None = _readline,
         prompt_toolkit_session_factory: Any | None = _PromptToolkitSession,
+        prompt_toolkit_session: Any | None = None,
         stdin: Any | None = None,
         stdout: Any | None = None,
     ) -> None:
@@ -896,7 +1029,7 @@ class CLIInputSession:
         self.slash_commands = slash_commands
         self.readline = readline_module
         self.prompt_toolkit_session_factory = prompt_toolkit_session_factory
-        self._prompt_toolkit_session: Any | None = None
+        self._prompt_toolkit_session: Any | None = prompt_toolkit_session
         self.stdin = stdin if stdin is not None else sys.stdin
         self.stdout = stdout if stdout is not None else sys.stdout
         self._previous_completer: Any | None = None
@@ -997,6 +1130,7 @@ class CLIView:
     ) -> None:
         self.style = style or CLIStyle()
         self.width = width or terminal_width()
+        self._thinking_indicator: CLIThinkingIndicator | None = None
 
     def _print(self, text: str = "", *, end: str = "\n", flush: bool = False) -> None:
         print(text, end=end, flush=flush)
@@ -1107,6 +1241,7 @@ class CLIView:
         max_tool_rounds: int,
         max_repeated_tool_calls: int,
         reflection_enabled: bool,
+        stream_output_enabled: bool,
         cache_enabled: bool,
         cache_connected: bool,
         trace_enabled: bool,
@@ -1186,6 +1321,7 @@ class CLIView:
                 [
                     ("memory", self._on_off(memory_enabled)),
                     ("reflection", self._on_off(reflection_enabled)),
+                    ("stream output", self._on_off(stream_output_enabled)),
                     ("cache", cache_value),
                     ("trace", trace_value),
                     ("live events", self._on_off(live_events_enabled)),
@@ -1267,6 +1403,17 @@ class CLIView:
         self._print()
         self._print(self.style.bold("Assistant"))
 
+    def start_thinking(self, text: str = "正在分析问题...") -> "CLIThinkingIndicator":
+        indicator = CLIThinkingIndicator(self, text=text)
+        self._thinking_indicator = indicator
+        indicator.start()
+        return indicator
+
+    def update_thinking(self, text: str) -> None:
+        indicator = self._thinking_indicator
+        if indicator is not None and indicator.active:
+            indicator.update(text)
+
     def print_assistant_delta(self, text: str) -> None:
         self._print(text, end="", flush=True)
 
@@ -1279,7 +1426,112 @@ class CLIView:
         self._print(self.style.error(f"  {text}"))
 
     def print_live_event(self, text: str) -> None:
+        indicator = self._thinking_indicator
+        if indicator is not None and indicator.active and indicator.interactive:
+            indicator.clear_line()
+            self._print(self.style.dim(text), flush=True)
+            indicator.render()
+            return
         self._print(self.style.dim(text), flush=True)
+
+
+class CLIThinkingIndicator:
+    """Small same-line thinking animation for interactive terminals."""
+
+    DEFAULT_TEXT = "正在分析问题..."
+    DOT_FRAMES = (".  ", ".. ", "...")
+    COLOR_STYLES = (
+        CLIStyle.ACCENT,
+        CLIStyle.LOGO_GREEN,
+        CLIStyle.LOGO_PURPLE,
+        CLIStyle.WARNING,
+    )
+
+    def __init__(
+        self,
+        view: CLIView,
+        *,
+        text: str = DEFAULT_TEXT,
+        interval_s: float = 0.35,
+    ) -> None:
+        self.view = view
+        self.text = text.rstrip(".")
+        self.interval_s = interval_s
+        self.interactive = False
+        self.active = False
+        self._task: asyncio.Task[None] | None = None
+        self._color_index = 0
+        self._frame_index = 0
+
+    def start(self) -> None:
+        self.interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self.active = True
+        self.view._print()
+        if not self.interactive:
+            self.view._print(self.view.style.dim(self.static_text()), flush=True)
+            return
+        self.render()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._animate())
+
+    async def _animate(self) -> None:
+        try:
+            while self.active:
+                self._frame_index = (self._frame_index + 1) % len(self.DOT_FRAMES)
+                if self._frame_index == 0:
+                    self._color_index = (
+                        self._color_index + 1
+                    ) % len(self.COLOR_STYLES)
+                self.render()
+                await asyncio.sleep(self.interval_s)
+        except asyncio.CancelledError:
+            return
+
+    def current_text(self) -> str:
+        return f"{self.text}{self.DOT_FRAMES[self._frame_index]}"
+
+    def static_text(self) -> str:
+        return f"{self.text}..."
+
+    def update(self, text: str) -> None:
+        normalized = text.rstrip(".")
+        if not normalized or normalized == self.text:
+            return
+        self.text = normalized
+        self._frame_index = 0
+        if self.interactive:
+            self.render()
+        else:
+            self.view._print(self.view.style.dim(self.static_text()), flush=True)
+
+    def clear_line(self) -> None:
+        if self.interactive:
+            print("\r\033[K", end="", flush=True)
+
+    def render(self) -> None:
+        if not self.interactive:
+            return
+        color = self.COLOR_STYLES[self._color_index]
+        frame = self.view.style.apply(self.current_text(), color)
+        print(f"\r{frame}", end="", flush=True)
+
+    async def stop(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        self.clear_line()
+        if self.view._thinking_indicator is self:
+            self.view._thinking_indicator = None
 
 
 MEMORY_LAYER_LABELS = {
@@ -1522,6 +1774,28 @@ def next_repeated_tool_call_count(
     return 1
 
 
+def tool_call_id(tool_call: dict[str, Any], index: int) -> str:
+    raw_id = tool_call.get("id")
+    return str(raw_id) if raw_id else f"invalid-tool-call-{index}"
+
+
+def invalid_tool_call_message(
+    tool_call: dict[str, Any],
+    *,
+    index: int,
+    reason: str,
+) -> dict[str, str]:
+    return {
+        "role": "tool",
+        "content": (
+            f"工具调用无效：{reason}。"
+            f"本次收到的工具调用: {preview_text(tool_call)}。"
+            "请重新生成合法的工具调用，或在无法调用工具时直接回答。"
+        ),
+        "tool_call_id": tool_call_id(tool_call, index),
+    }
+
+
 def build_agent(
     rag: RAGService,
     *,
@@ -1544,6 +1818,8 @@ def build_agent(
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS,
     reflection_enabled: bool = DEFAULT_REFLECTION_ENABLED,
+    stream_output_enabled: bool = DEFAULT_STREAM_OUTPUT_ENABLED,
+    output_delta_sink: Callable[[str], Any] | None = None,
     cache: JsonCache | None = None,
     cache_ttls: dict[str, int] | None = None,
 ):
@@ -1594,6 +1870,8 @@ def build_agent(
         model_name=agent_model_name,
         **(agent_model_kwargs or {}),
     )
+    if stream_output_enabled and output_delta_sink is not None:
+        base_model = model_with_streaming_enabled(base_model)
     model = base_model.bind_tools(tools)
     reflection_agent = (
         ReflectionAgent(
@@ -1755,12 +2033,83 @@ def build_agent(
                 },
             )
         model_messages = [*prompt_messages, *state["messages"]]
-        response = await ainvoke_with_retry(
-            lambda: model.ainvoke(model_messages),
-            retry_policy=retry_policy,
-            operation="agent.model_ainvoke",
-            on_failure=trace_model_retry_failure,
+        should_stream_output = (
+            stream_output_enabled
+            and output_delta_sink is not None
+            and hasattr(model, "astream")
         )
+        if should_stream_output:
+            chunks: list[AIMessageChunk] = []
+            emitted_content = ""
+            response: Any = None
+            try:
+                async for chunk in model.astream(model_messages):
+                    if not isinstance(chunk, AIMessageChunk):
+                        response = chunk
+                        break
+                    chunks.append(chunk)
+                    content = coerce_message_content(chunk.content)
+                    if not content:
+                        continue
+                    if chunk.tool_calls or chunk.tool_call_chunks:
+                        if emitted_content:
+                            sys.stdout.write("\r\033[K")
+                            sys.stdout.flush()
+                        emitted_content = ""
+                        continue
+                    if any(item.tool_calls or item.tool_call_chunks for item in chunks):
+                        continue
+                    await maybe_emit_output_delta(output_delta_sink, content)
+                    emitted_content += content
+                else:
+                    response = ai_message_from_chunks(chunks)
+            except Exception as error:
+                if emitted_content:
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                has_tool_call_chunks = any(
+                    item.tool_calls or item.tool_call_chunks for item in chunks
+                )
+                if not has_tool_call_chunks:
+                    if trace_recorder is not None:
+                        trace_recorder.event(
+                            "model",
+                            "agent.model_stream_fallback_to_invoke",
+                            {
+                                "error": repr(error),
+                                "emitted_chars": len(emitted_content),
+                            },
+                            level="warning",
+                        )
+                    response = await ainvoke_with_retry(
+                        lambda: model.ainvoke(model_messages),
+                        retry_policy=retry_policy,
+                        operation="agent.model_ainvoke",
+                        on_failure=trace_model_retry_failure,
+                    )
+                    emitted_content = ""
+                elif chunks or emitted_content:
+                    raise
+                else:
+                    response = await ainvoke_with_retry(
+                        lambda: model.ainvoke(model_messages),
+                        retry_policy=retry_policy,
+                        operation="agent.model_ainvoke",
+                        on_failure=trace_model_retry_failure,
+                    )
+                    emitted_content = ""
+            if isinstance(response, AIMessage) and not response.tool_calls:
+                if not emitted_content:
+                    answer = coerce_message_content(response.content)
+                    if answer:
+                        await maybe_emit_output_delta(output_delta_sink, answer)
+        else:
+            response = await ainvoke_with_retry(
+                lambda: model.ainvoke(model_messages),
+                retry_policy=retry_policy,
+                operation="agent.model_ainvoke",
+                on_failure=trace_model_retry_failure,
+            )
         if trace_recorder is not None:
             trace_recorder.event(
                 "model",
@@ -1782,6 +2131,7 @@ def build_agent(
             )
         if (
             reflection_agent is not None
+            and not should_stream_output
             and isinstance(response, AIMessage)
             and not response.tool_calls
         ):
@@ -1892,10 +2242,26 @@ def build_agent(
 
         allowed_names = allowed_tool_names()
 
-        async def run_tool_call(tool_call: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-            selected_tool = tool_map.get(tool_call["name"])
+        async def run_tool_call(
+            tool_call: dict[str, Any],
+            index: int,
+        ) -> tuple[dict[str, Any], Any]:
+            tool_name = str(tool_call.get("name") or "").strip()
+            if not tool_name:
+                return tool_call, invalid_tool_call_message(
+                    tool_call,
+                    index=index,
+                    reason="工具调用缺少 name",
+                )
+            if "args" not in tool_call:
+                return tool_call, invalid_tool_call_message(
+                    tool_call,
+                    index=index,
+                    reason=f"工具 {tool_name} 缺少 args",
+                )
+            selected_tool = tool_map.get(tool_name)
             if selected_tool is None:
-                return tool_call, f"未知工具: {tool_call['name']}"
+                return tool_call, f"未知工具: {tool_name}"
             elif (
                 allowed_names is not None
                 and selected_tool.name not in allowed_names
@@ -1917,7 +2283,26 @@ def build_agent(
                     },
                 )
             try:
-                tool_result = await selected_tool.ainvoke(tool_call["args"])
+                tool_result = await selected_tool.ainvoke(tool_call.get("args"))
+            except ValidationError as error:
+                tool_result = format_tool_validation_error(
+                    selected_tool.name,
+                    error,
+                    tool_call.get("args"),
+                )
+                if trace_recorder is not None:
+                    trace_recorder.event(
+                        "tool",
+                        "agent.tool_call_validation_error",
+                        {
+                            "tool_name": selected_tool.name,
+                            "tool_category": tool_category(selected_tool.name),
+                            "args": tool_call.get("args"),
+                            "error": repr(error),
+                            "result_preview": preview_text(tool_result),
+                        },
+                        level="warning",
+                    )
             except Exception as error:
                 if trace_recorder is not None:
                     trace_recorder.event(
@@ -1944,12 +2329,19 @@ def build_agent(
             return tool_call, tool_result
 
         tool_results = await asyncio.gather(
-            *(run_tool_call(tool_call) for tool_call in last_message.tool_calls)
+            *(
+                run_tool_call(tool_call, index)
+                for index, tool_call in enumerate(last_message.tool_calls)
+            )
         )
 
         tool_messages = []
-        for tool_call, tool_result in tool_results:
-            selected_tool = tool_map.get(tool_call["name"])
+        for index, (tool_call, tool_result) in enumerate(tool_results):
+            if isinstance(tool_result, dict) and tool_result.get("role") == "tool":
+                tool_messages.append(tool_result)
+                continue
+            tool_name = str(tool_call.get("name") or "").strip()
+            selected_tool = tool_map.get(tool_name)
             if (
                 selected_tool is not None
                 and selected_tool.name == "load_skill"
@@ -1973,7 +2365,7 @@ def build_agent(
                         if isinstance(tool_result, str | list)
                         else str(tool_result)
                     ),
-                    "tool_call_id": tool_call["id"],
+                    "tool_call_id": tool_call_id(tool_call, index),
                 }
             )
         return {
@@ -2172,6 +2564,7 @@ async def run_cli_async(
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     max_repeated_tool_calls: int = DEFAULT_MAX_REPEATED_TOOL_CALLS,
     reflection_enabled: bool = DEFAULT_REFLECTION_ENABLED,
+    stream_output_enabled: bool = DEFAULT_STREAM_OUTPUT_ENABLED,
     cache_enabled: bool = False,
     cache_redis_url: str = "redis://localhost:6379/0",
     cache_namespace: str = "rag-server",
@@ -2202,21 +2595,20 @@ async def run_cli_async(
         namespace=cache_namespace,
         socket_timeout_s=cache_socket_timeout_s,
     )
-    trace_recorder = None
-    if trace_enabled or live_events_enabled:
-        trace_recorder = TraceRecorder(
-            trace_dir=trace_dir,
-            enabled=trace_enabled,
-            default_tags={
-                "entrypoint": "cli",
-                "user_id": user_id,
-                "agent_provider": agent_provider,
-                "agent_model": agent_model_name,
-            },
-            event_sinks=[
-                CLILiveEventPrinter(enabled=live_events_enabled, view=view),
-            ],
-        )
+    trace_recorder = TraceRecorder(
+        trace_dir=trace_dir,
+        enabled=trace_enabled,
+        default_tags={
+            "entrypoint": "cli",
+            "user_id": user_id,
+            "agent_provider": agent_provider,
+            "agent_model": agent_model_name,
+        },
+        event_sinks=[
+            CLIStatusEventSink(view),
+            CLILiveEventPrinter(enabled=live_events_enabled, view=view),
+        ],
+    )
     if trace_recorder is not None:
         trace_recorder.event(
             "runtime",
@@ -2257,6 +2649,7 @@ async def run_cli_async(
                 "max_tool_rounds": max_tool_rounds,
                 "max_repeated_tool_calls": max_repeated_tool_calls,
                 "reflection_enabled": reflection_enabled,
+                "stream_output_enabled": stream_output_enabled,
                 "cache_enabled": cache_enabled,
                 "cache_available": cache is not None,
                 "cache_namespace": cache_namespace,
@@ -2326,6 +2719,7 @@ async def run_cli_async(
                 "tool_count": len(mcp_tools),
             },
         )
+    output_delta_dispatcher = OutputDeltaDispatcher()
     app, model, system_prompt = build_agent(
         rag,
         query_rewrite_mode=actual_query_rewrite_mode,
@@ -2346,10 +2740,17 @@ async def run_cli_async(
         max_tool_rounds=max_tool_rounds,
         max_repeated_tool_calls=max_repeated_tool_calls,
         reflection_enabled=reflection_enabled,
+        stream_output_enabled=stream_output_enabled,
+        output_delta_sink=output_delta_dispatcher,
         cache=cache,
         cache_ttls=cache_ttls,
     )
     messages: list[BaseMessage] = []
+
+    # 在 print_startup 之前预创建 PromptSession，终端能力检测耗时被打印输出掩盖。
+    prompt_toolkit_session: Any | None = None
+    if sys.stdin.isatty() and sys.stdout.isatty() and _PromptToolkitSession is not None:
+        prompt_toolkit_session = _PromptToolkitSession()
 
     view.print_startup(
         show_config=show_config,
@@ -2373,6 +2774,7 @@ async def run_cli_async(
         max_tool_rounds=max_tool_rounds,
         max_repeated_tool_calls=max_repeated_tool_calls,
         reflection_enabled=reflection_enabled,
+        stream_output_enabled=stream_output_enabled,
         cache_enabled=cache_enabled,
         cache_connected=cache is not None,
         trace_enabled=trace_enabled,
@@ -2385,7 +2787,11 @@ async def run_cli_async(
     )
     slash_commands = available_slash_command_specs(skill_registry)
     try:
-        input_session = CLIInputSession(view=view, slash_commands=slash_commands)
+        input_session = CLIInputSession(
+            view=view,
+            slash_commands=slash_commands,
+            prompt_toolkit_session=prompt_toolkit_session,
+        )
         input_session.enable_completion()
         while True:
             user_input = await input_session.prompt_async()
@@ -2430,10 +2836,27 @@ async def run_cli_async(
                     },
                 )
             try:
-                view.begin_assistant()
+                thinking_indicator = view.start_thinking()
+                assistant_started = False
                 streamed_content = ""
                 final_message = None
                 turn_messages: list[BaseMessage] = []
+                stream_sink_used = False
+                stream_final_message_seen = False
+
+                async def print_stream_delta(text: str) -> None:
+                    nonlocal assistant_started, stream_sink_used
+                    if not text:
+                        return
+                    if not assistant_started:
+                        view.update_thinking("正在组织答案...")
+                        await thinking_indicator.stop()
+                        view.begin_assistant()
+                        assistant_started = True
+                    view.print_assistant_delta(text)
+                    stream_sink_used = True
+
+                output_delta_dispatcher.sink = print_stream_delta
                 async for event in app.astream(
                     {
                         "messages": input_messages,
@@ -2455,15 +2878,45 @@ async def run_cli_async(
                                 continue
                             content = coerce_message_content(msg.content).strip()
                             if content and content != streamed_content:
-                                new_text = content[len(streamed_content):]
-                                view.print_assistant_delta(new_text)
+                                stream_final_message_seen = True
+                                if not assistant_started:
+                                    view.update_thinking("正在组织答案...")
+                                    await thinking_indicator.stop()
+                                    view.begin_assistant()
+                                    assistant_started = True
+                                new_text = (
+                                    ""
+                                    if stream_sink_used
+                                    else content[len(streamed_content):]
+                                )
+                                if stream_sink_used:
+                                    await thinking_indicator.stop()
+                                elif new_text:
+                                    view.print_assistant_delta(new_text)
                                 streamed_content = content
                                 final_message = msg
-                if streamed_content:
+                if streamed_content or stream_sink_used:
                     view.end_assistant()
             except Exception as error:
-                if streamed_content:
+                if "thinking_indicator" in locals():
+                    await thinking_indicator.stop()
+                if streamed_content or (stream_sink_used and stream_final_message_seen):
                     view.end_assistant()
+                    if trace_recorder is not None:
+                        trace_recorder.event(
+                            "agent",
+                            "agent.user_turn_stream_tail_error_ignored",
+                            {
+                                "user_id": user_id,
+                                "error": repr(error),
+                                "elapsed_ms": (
+                                    time.perf_counter() - turn_start
+                                )
+                                * 1000,
+                            },
+                            level="warning",
+                        )
+                    continue
                 if trace_recorder is not None:
                     trace_recorder.event(
                         "agent",
@@ -2483,6 +2936,8 @@ async def run_cli_async(
                     format_tongyi_error(model, model_messages, error)
                 )
                 continue
+            finally:
+                output_delta_dispatcher.sink = None
 
             messages = input_messages + turn_messages
 
@@ -2493,6 +2948,11 @@ async def run_cli_async(
 
             if isinstance(final_message, AIMessage):
                 if not streamed_content:
+                    if not assistant_started:
+                        view.update_thinking("正在组织答案...")
+                        await thinking_indicator.stop()
+                        view.begin_assistant()
+                        assistant_started = True
                     content = coerce_message_content(final_message.content)
                     view.print_assistant_delta(content)
                     view.end_assistant()
@@ -2513,6 +2973,8 @@ async def run_cli_async(
                             **message_usage_metadata(final_message),
                         },
                     )
+            else:
+                await thinking_indicator.stop()
     finally:
         if "input_session" in locals():
             input_session.restore_completion()
@@ -2748,6 +3210,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Defaults to config value."
         ),
     )
+    general.add_argument(
+        "--stream-output",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Stream assistant answer tokens as they are generated. "
+            "Defaults to config value."
+        ),
+    )
     tracing.add_argument(
         "--trace-dir",
         default=None,
@@ -2956,6 +3427,13 @@ def build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         _put_override(overrides, "trace", "live", args.live_events == "on")
     if args.show_config is not None:
         _put_override(overrides, "cli", "show_config", args.show_config == "on")
+    if args.stream_output is not None:
+        _put_override(
+            overrides,
+            "cli",
+            "stream_output",
+            args.stream_output == "on",
+        )
     if args.cache is not None:
         _put_override(overrides, "cache", "enabled", args.cache == "on")
     _put_override(overrides, "cache", "redis_url", args.redis_url)

@@ -288,9 +288,37 @@ def build_skill_tools(
             )
         return result
 
-    @tool(description="读取已加载 skill 目录下的支撑文件，relative_path 必须是相对路径。")
-    def read_skill_file(name: str, relative_path: str) -> str:
+    @tool(description="读取已加载 skill 目录下的支撑文件；relative_path 是支撑文件相对路径。")
+    def read_skill_file(name: str, relative_path: str = "") -> str:
         """Read a supporting file from a skill directory."""
+        if not relative_path.strip():
+            available_files = skill_registry.list_supporting_files(name)
+            if available_files:
+                files = ", ".join(available_files)
+                result = (
+                    "read_skill_file 缺少 relative_path。"
+                    f"可读取的支撑文件: {files}。"
+                    "如果只是要读取完整 SKILL.md，请调用 load_skill(name)。"
+                )
+            else:
+                result = (
+                    "read_skill_file 缺少 relative_path。"
+                    "当前 skill 没有可读取的支撑文件；"
+                    "如果只是要读取完整 SKILL.md，请调用 load_skill(name)。"
+                )
+            if trace_recorder is not None:
+                trace_recorder.event(
+                    "skill",
+                    "skill.read_skill_file_missing_path",
+                    {
+                        "name": name,
+                        "skill_name": str(name).strip().lower(),
+                        "available_files": available_files,
+                        "result_preview": preview_text(result),
+                    },
+                    level="warning",
+                )
+            return result
         result = skill_registry.read_supporting_file(name, relative_path)
         if trace_recorder is not None:
             trace_recorder.event(

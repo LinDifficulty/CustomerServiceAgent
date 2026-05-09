@@ -95,7 +95,6 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-multipart==0.0.27
 pyyaml==6.0.3
--e file:///Users/zhangyu/Desktop/RAG%20Server
 rank-bm25==0.2.2
 redis==7.4.0
 referencing==0.37.0

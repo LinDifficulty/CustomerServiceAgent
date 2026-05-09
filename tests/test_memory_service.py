@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from rag_server.cache_service import InMemoryJsonCache
 from rag_server.memory_service import (
     MEMORY_LAYERS,
     MEMORY_TYPES,
@@ -30,6 +32,15 @@ class FakeEmbeddings:
         if "洗涤" in text or "洗" in text:
             return [0.0, 0.0, 1.0, 0.0]
         return [0.0, 0.0, 0.0, 1.0]
+
+
+class CountingEmbeddings(FakeEmbeddings):
+    def __init__(self) -> None:
+        self.document_calls = 0
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.document_calls += len(texts)
+        return super().embed_documents(texts)
 
 
 class FakeModel:
@@ -90,6 +101,26 @@ class MemoryServiceTests(unittest.TestCase):
         self.assertGreater(len(results), 0)
         self.assertIn("score", results[0])
 
+    def test_search_memory_uses_cache_for_repeated_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            embeddings = CountingEmbeddings()
+            ms = MemoryService(
+                data_dir=temp_dir,
+                embeddings=embeddings,
+                cache=InMemoryJsonCache(namespace="memory-test"),
+            )
+            ms.add_memory("u1", "身高175cm", memory_type="profile")
+            calls_after_add = embeddings.document_calls
+
+            first = ms.search_memory("u1", "尺码 身高", top_k=2)
+            calls_after_first = embeddings.document_calls
+            second = ms.search_memory("u1", "尺码 身高", top_k=2)
+            ms.close()
+
+        self.assertEqual(len(second), len(first))
+        self.assertEqual(calls_after_first, calls_after_add + 1)
+        self.assertEqual(embeddings.document_calls, calls_after_first)
+
     def test_search_memory_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ms = MemoryService(data_dir=temp_dir, embeddings=FakeEmbeddings())
@@ -98,6 +129,23 @@ class MemoryServiceTests(unittest.TestCase):
             ms.add_memory("u1", "每次先查尺码表", memory_type="procedure")
             layered = ms.search_memory_layers("u1", "身高 尺码")
             ms.close()
+
+        self.assertIn("profile", layered)
+        self.assertIn("episode", layered)
+        self.assertIn("procedure", layered)
+
+    def test_asearch_memory_layers(self) -> None:
+        async def run_case() -> dict[str, list[dict]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                ms = MemoryService(data_dir=temp_dir, embeddings=FakeEmbeddings())
+                ms.add_memory("u1", "身高175cm", memory_type="profile")
+                ms.add_memory("u1", "上次买了M码", memory_type="episode")
+                ms.add_memory("u1", "每次先查尺码表", memory_type="procedure")
+                layered = await ms.asearch_memory_layers("u1", "身高 尺码")
+                ms.close()
+                return layered
+
+        layered = asyncio.run(run_case())
 
         self.assertIn("profile", layered)
         self.assertIn("episode", layered)
@@ -195,6 +243,18 @@ class LLMMemoryExtractorTests(unittest.TestCase):
             user_message="你好",
             assistant_message="您好！",
         )
+        self.assertEqual(result, [])
+
+    def test_aextract_returns_empty_list_for_no_memories(self) -> None:
+        async def run_case() -> list[ExtractedMemory]:
+            extractor = LLMMemoryExtractor(model=FakeModel())
+            return await extractor.aextract(
+                user_message="你好",
+                assistant_message="您好！",
+            )
+
+        result = asyncio.run(run_case())
+
         self.assertEqual(result, [])
 
     def test_extract_parses_valid_memories(self) -> None:

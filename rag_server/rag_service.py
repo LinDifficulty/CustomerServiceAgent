@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -16,6 +17,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from rank_bm25 import BM25Plus
 
+from .cache_service import CacheTTLs, JsonCache, stable_cache_digest
 from .model_factory import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_PROVIDER,
@@ -113,6 +115,8 @@ class RAGService:
         parent_chunk_overlap: int | None = None,
         trace_recorder: TraceRecorder | None = None,
         multi_vector_weights: dict[str, float] | None = None,
+        cache: JsonCache | None = None,
+        cache_ttls: dict[str, Any] | None = None,
     ) -> None:
         # 所有索引和元数据都保存在 data_dir，方便持久化复用。
         self.base_dir = Path(data_dir)
@@ -165,6 +169,9 @@ class RAGService:
         self.multi_vector_weights = self._normalize_multi_vector_weights(
             multi_vector_weights
         )
+        self.cache = cache
+        self.cache_ttls = CacheTTLs.from_mapping(cache_ttls)
+        self._cache_index_version: str | None = None
 
         self.documents = self._load_documents_manifest()
         self.records = self._load_records()
@@ -390,6 +397,77 @@ class RAGService:
             return
         self.trace_recorder.event("rag", name, payload)
 
+    def _cache_key(self, category: str, payload: dict[str, Any]) -> str | None:
+        if self.cache is None:
+            return None
+        return self.cache.make_key(category, payload)
+
+    def _read_cached_list(
+        self,
+        category: str,
+        payload: dict[str, Any],
+    ) -> list[dict] | None:
+        key = self._cache_key(category, payload)
+        if key is None or self.cache is None:
+            return None
+        cached = self.cache.get_json(key)
+        if not isinstance(cached, list):
+            return None
+        return [dict(item) for item in cached if isinstance(item, dict)]
+
+    def _write_cached_list(
+        self,
+        category: str,
+        payload: dict[str, Any],
+        value: list[dict],
+        ttl_s: int,
+    ) -> None:
+        key = self._cache_key(category, payload)
+        if key is None or self.cache is None:
+            return
+        self.cache.set_json(key, value, ttl_s=ttl_s)
+
+    def _knowledge_cache_version(self) -> str:
+        if self._cache_index_version is None:
+            self._cache_index_version = stable_cache_digest(
+                {
+                    "documents": self.documents,
+                    "embedding_config_hash": self.embedding_config_hash,
+                    "multi_vector_weights": self.multi_vector_weights,
+                    "record_count": len(self.records),
+                    "records": [
+                        {
+                            "id": record.get("id"),
+                            "doc_id": record.get("doc_id"),
+                            "content_hash": record.get("content_hash"),
+                            "parent_id": record.get("parent_id"),
+                            "parent_content_hash": record.get(
+                                "parent_content_hash"
+                            ),
+                        }
+                        for record in self.records
+                    ],
+                }
+            )
+        return self._cache_index_version
+
+    def _invalidate_cache_version(self) -> None:
+        self._cache_index_version = None
+
+    def _retrieval_cache_payload(
+        self,
+        method: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return {
+            "method": method,
+            "knowledge_version": self._knowledge_cache_version(),
+            "embedding_provider": self.embedding_provider,
+            "embedding_model_name": self.embedding_model_name,
+            "embedding_config_hash": self.embedding_config_hash,
+            **kwargs,
+        }
+
     def search_by_vector(self, query: str, top_k: int = 3) -> list[dict]:
         """仅使用向量召回。"""
         start = time.perf_counter()
@@ -577,6 +655,37 @@ class RAGService:
         actual_bm25_weight = bm25_weight if actual_use_bm25 else 0.0
         self._validate_weights(actual_vector_weight, actual_bm25_weight)
 
+        cache_payload = self._retrieval_cache_payload(
+            "search_by_hybrid",
+            query=query,
+            top_k=top_k,
+            vector_weight=actual_vector_weight,
+            bm25_weight=actual_bm25_weight,
+            use_bm25=actual_use_bm25,
+        )
+        cached_results = self._read_cached_list("retrieval", cache_payload)
+        if cached_results is not None:
+            self._trace_event(
+                "rag.search_by_hybrid",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "vector_weight": actual_vector_weight,
+                    "bm25_weight": actual_bm25_weight,
+                    "use_bm25": actual_use_bm25,
+                    "candidate_count": None,
+                    "vector_row_count": len(self.vector_rows),
+                    "result_count": len(cached_results),
+                    "cache_hit": True,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                    "results": [
+                        summarize_result(item, include_content=True)
+                        for item in cached_results
+                    ],
+                },
+            )
+            return cached_results
+
         limit = self._candidate_limit(top_k)
         vector_details = self._vector_score_details_map(query, limit)
         vector_scores = {
@@ -618,6 +727,12 @@ class RAGService:
 
         ranked_results.sort(key=lambda item: item["score"], reverse=True)
         results = self._deduplicate_parent_results(ranked_results)[:top_k]
+        self._write_cached_list(
+            "retrieval",
+            cache_payload,
+            results,
+            ttl_s=self.cache_ttls.retrieval_ttl_s,
+        )
         self._trace_event(
             "rag.search_by_hybrid",
             {
@@ -629,6 +744,139 @@ class RAGService:
                 "candidate_count": len(candidate_ids),
                 "vector_row_count": len(self.vector_rows),
                 "result_count": len(results),
+                "cache_hit": False,
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+                "results": [
+                    summarize_result(item, include_content=True) for item in results
+                ],
+            },
+        )
+        return results
+
+    async def asearch_by_hybrid(
+        self,
+        query: str,
+        top_k: int = 10,
+        vector_weight: float = 0.7,
+        bm25_weight: float = 0.3,
+        use_bm25: bool | None = None,
+    ) -> list[dict]:
+        """Async hybrid retrieval with vector and BM25 branches run concurrently."""
+        start = time.perf_counter()
+        if not query.strip() or not self.records:
+            self._trace_event(
+                "rag.search_by_hybrid",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "result_count": 0,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                },
+            )
+            return []
+
+        actual_use_bm25 = (
+            self.default_use_bm25 if use_bm25 is None else use_bm25
+        )
+        actual_vector_weight = 1.0 if not actual_use_bm25 else vector_weight
+        actual_bm25_weight = bm25_weight if actual_use_bm25 else 0.0
+        self._validate_weights(actual_vector_weight, actual_bm25_weight)
+
+        cache_payload = self._retrieval_cache_payload(
+            "search_by_hybrid",
+            query=query,
+            top_k=top_k,
+            vector_weight=actual_vector_weight,
+            bm25_weight=actual_bm25_weight,
+            use_bm25=actual_use_bm25,
+        )
+        cached_results = self._read_cached_list("retrieval", cache_payload)
+        if cached_results is not None:
+            self._trace_event(
+                "rag.search_by_hybrid",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "vector_weight": actual_vector_weight,
+                    "bm25_weight": actual_bm25_weight,
+                    "use_bm25": actual_use_bm25,
+                    "candidate_count": None,
+                    "vector_row_count": len(self.vector_rows),
+                    "result_count": len(cached_results),
+                    "cache_hit": True,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                    "results": [
+                        summarize_result(item, include_content=True)
+                        for item in cached_results
+                    ],
+                },
+            )
+            return cached_results
+
+        limit = self._candidate_limit(top_k)
+        vector_task = asyncio.to_thread(self._vector_score_details_map, query, limit)
+        bm25_task = (
+            asyncio.to_thread(self._bm25_score_map, query, limit)
+            if actual_use_bm25
+            else asyncio.sleep(0, result={})
+        )
+        vector_details, bm25_scores = await asyncio.gather(vector_task, bm25_task)
+        vector_scores = {
+            idx: float(details["score"]) for idx, details in vector_details.items()
+        }
+        candidate_ids = set(vector_scores) | set(bm25_scores)
+
+        ranked_results = []
+        for idx in candidate_ids:
+            vector_score = vector_scores.get(idx, 0.0)
+            bm25_score = bm25_scores.get(idx, 0.0)
+            details = vector_details.get(
+                idx,
+                {
+                    "scores": {},
+                    "matched_vector_types": [],
+                    "best_vector_type": None,
+                },
+            )
+            hybrid_score = (
+                actual_vector_weight * vector_score
+                + actual_bm25_weight * bm25_score
+            )
+            ranked_results.append(
+                self._build_result(
+                    idx=idx,
+                    score=hybrid_score,
+                    vector_score=vector_score,
+                    bm25_score=bm25_score,
+                    hybrid_score=hybrid_score,
+                    rerank_score=None,
+                    retrieval_mode="hybrid" if actual_use_bm25 else "multi_vector",
+                    multi_vector_scores=details["scores"],
+                    matched_vector_types=details["matched_vector_types"],
+                    best_vector_type=details["best_vector_type"],
+                )
+            )
+
+        ranked_results.sort(key=lambda item: item["score"], reverse=True)
+        results = self._deduplicate_parent_results(ranked_results)[:top_k]
+        self._write_cached_list(
+            "retrieval",
+            cache_payload,
+            results,
+            ttl_s=self.cache_ttls.retrieval_ttl_s,
+        )
+        self._trace_event(
+            "rag.search_by_hybrid",
+            {
+                "query": query,
+                "top_k": top_k,
+                "vector_weight": actual_vector_weight,
+                "bm25_weight": actual_bm25_weight,
+                "use_bm25": actual_use_bm25,
+                "candidate_count": len(candidate_ids),
+                "vector_row_count": len(self.vector_rows),
+                "result_count": len(results),
+                "cache_hit": False,
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
                 "results": [
                     summarize_result(item, include_content=True) for item in results
@@ -658,6 +906,37 @@ class RAGService:
             )
             return []
 
+        cache_payload = self._retrieval_cache_payload(
+            "rerank",
+            query=query,
+            candidates=candidates,
+            top_k=top_k,
+            reranker_provider=self.reranker_provider,
+            reranker_model_name=self.reranker_model_name,
+            reranker_model_kwargs=self.reranker_model_kwargs,
+            reranker_device=self.reranker_device,
+        )
+        cached_results = self._read_cached_list("rerank", cache_payload)
+        if cached_results is not None:
+            self._trace_event(
+                "rag.rerank",
+                {
+                    "query": query,
+                    "reranker_provider": self.reranker_provider,
+                    "reranker_model_name": self.reranker_model_name,
+                    "candidate_count": len(candidates),
+                    "top_k": top_k,
+                    "result_count": len(cached_results),
+                    "cache_hit": True,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                    "results": [
+                        summarize_result(item, include_content=True)
+                        for item in cached_results
+                    ],
+                },
+            )
+            return cached_results
+
         reranker = self._get_reranker()
         pairs = [(query, item["content"]) for item in candidates]
         raw_scores = reranker.predict(
@@ -677,6 +956,12 @@ class RAGService:
 
         reranked.sort(key=lambda item: item["score"], reverse=True)
         results = reranked if top_k is None else reranked[:top_k]
+        self._write_cached_list(
+            "rerank",
+            cache_payload,
+            results,
+            ttl_s=self.cache_ttls.rerank_ttl_s,
+        )
         self._trace_event(
             "rag.rerank",
             {
@@ -686,6 +971,7 @@ class RAGService:
                 "candidate_count": len(candidates),
                 "top_k": top_k,
                 "result_count": len(results),
+                "cache_hit": False,
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
                 "candidates": [
                     summarize_result(item, include_content=True)
@@ -697,6 +983,19 @@ class RAGService:
             },
         )
         return results
+
+    async def arerank(
+        self,
+        query: str,
+        candidates: list[dict],
+        top_k: int | None = None,
+    ) -> list[dict]:
+        return await asyncio.to_thread(
+            self.rerank,
+            query=query,
+            candidates=candidates,
+            top_k=top_k,
+        )
 
     def search(
         self,
@@ -730,6 +1029,39 @@ class RAGService:
         )
         actual_candidate_top_k = candidate_top_k or self.default_candidate_top_k
         actual_candidate_top_k = max(actual_candidate_top_k, top_k)
+        actual_use_bm25 = self.default_use_bm25 if use_bm25 is None else use_bm25
+
+        cache_payload = self._retrieval_cache_payload(
+            "search",
+            query=query,
+            top_k=top_k,
+            candidate_top_k=actual_candidate_top_k,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
+            use_bm25=actual_use_bm25,
+            use_rerank=actual_use_rerank,
+        )
+        cached_results = self._read_cached_list("retrieval", cache_payload)
+        if cached_results is not None:
+            self._trace_event(
+                "rag.search",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "candidate_top_k": actual_candidate_top_k,
+                    "use_bm25": actual_use_bm25,
+                    "use_rerank": actual_use_rerank,
+                    "candidate_count": None,
+                    "result_count": len(cached_results),
+                    "cache_hit": True,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                    "results": [
+                        summarize_result(item, include_content=True)
+                        for item in cached_results
+                    ],
+                },
+            )
+            return cached_results
 
         hybrid_candidates = self.search_by_hybrid(
             query=query,
@@ -748,16 +1080,128 @@ class RAGService:
                 top_k=top_k,
             )
 
+        self._write_cached_list(
+            "retrieval",
+            cache_payload,
+            results,
+            ttl_s=self.cache_ttls.retrieval_ttl_s,
+        )
         self._trace_event(
             "rag.search",
             {
                 "query": query,
                 "top_k": top_k,
                 "candidate_top_k": actual_candidate_top_k,
-                "use_bm25": self.default_use_bm25 if use_bm25 is None else use_bm25,
+                "use_bm25": actual_use_bm25,
                 "use_rerank": actual_use_rerank,
                 "candidate_count": len(hybrid_candidates),
                 "result_count": len(results),
+                "cache_hit": False,
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+                "results": [
+                    summarize_result(item, include_content=True) for item in results
+                ],
+            },
+        )
+        return results
+
+    async def asearch(
+        self,
+        query: str,
+        top_k: int = 3,
+        vector_weight: float = 0.7,
+        bm25_weight: float = 0.3,
+        use_bm25: bool | None = None,
+        use_rerank: bool | None = None,
+        candidate_top_k: int | None = None,
+    ) -> list[dict]:
+        """Async search entrypoint preserving the synchronous search contract."""
+        start = time.perf_counter()
+        if not query.strip() or not self.records:
+            self._trace_event(
+                "rag.search",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "result_count": 0,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                },
+            )
+            return []
+
+        actual_use_rerank = (
+            self.default_use_rerank if use_rerank is None else use_rerank
+        )
+        actual_candidate_top_k = candidate_top_k or self.default_candidate_top_k
+        actual_candidate_top_k = max(actual_candidate_top_k, top_k)
+        actual_use_bm25 = self.default_use_bm25 if use_bm25 is None else use_bm25
+
+        cache_payload = self._retrieval_cache_payload(
+            "search",
+            query=query,
+            top_k=top_k,
+            candidate_top_k=actual_candidate_top_k,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
+            use_bm25=actual_use_bm25,
+            use_rerank=actual_use_rerank,
+        )
+        cached_results = self._read_cached_list("retrieval", cache_payload)
+        if cached_results is not None:
+            self._trace_event(
+                "rag.search",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "candidate_top_k": actual_candidate_top_k,
+                    "use_bm25": actual_use_bm25,
+                    "use_rerank": actual_use_rerank,
+                    "candidate_count": None,
+                    "result_count": len(cached_results),
+                    "cache_hit": True,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                    "results": [
+                        summarize_result(item, include_content=True)
+                        for item in cached_results
+                    ],
+                },
+            )
+            return cached_results
+
+        hybrid_candidates = await self.asearch_by_hybrid(
+            query=query,
+            top_k=actual_candidate_top_k,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
+            use_bm25=use_bm25,
+        )
+
+        if not actual_use_rerank:
+            results = hybrid_candidates[:top_k]
+        else:
+            results = await self.arerank(
+                query=query,
+                candidates=hybrid_candidates,
+                top_k=top_k,
+            )
+
+        self._write_cached_list(
+            "retrieval",
+            cache_payload,
+            results,
+            ttl_s=self.cache_ttls.retrieval_ttl_s,
+        )
+        self._trace_event(
+            "rag.search",
+            {
+                "query": query,
+                "top_k": top_k,
+                "candidate_top_k": actual_candidate_top_k,
+                "use_bm25": actual_use_bm25,
+                "use_rerank": actual_use_rerank,
+                "candidate_count": len(hybrid_candidates),
+                "result_count": len(results),
+                "cache_hit": False,
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
                 "results": [
                     summarize_result(item, include_content=True) for item in results
@@ -1099,12 +1543,35 @@ class RAGService:
         return matrix
 
     def _embed_query(self, text: str) -> np.ndarray:
+        cache_key = self._cache_key(
+            "embedding",
+            {
+                "kind": "query",
+                "text": text,
+                "embedding_provider": self.embedding_provider,
+                "embedding_model_name": self.embedding_model_name,
+                "embedding_config_hash": self.embedding_config_hash,
+            },
+        )
+        if cache_key is not None and self.cache is not None:
+            cached = self.cache.get_json(cache_key)
+            if isinstance(cached, list) and cached:
+                matrix = np.asarray([cached], dtype="float32")
+                if matrix.ndim == 2 and matrix.shape[1] > 0:
+                    return matrix
+
         if hasattr(self.embeddings, "embed_query"):
             vector = self.embeddings.embed_query(text)
         else:
             vector = self.embeddings.embed_documents([text])[0]
         matrix = np.asarray([vector], dtype="float32")
         faiss.normalize_L2(matrix)
+        if cache_key is not None and self.cache is not None:
+            self.cache.set_json(
+                cache_key,
+                matrix[0].tolist(),
+                ttl_s=self.cache_ttls.embedding_ttl_s,
+            )
         return matrix
 
     def _load_or_create_index(self, *, force_rebuild: bool = False) -> faiss.Index:
@@ -1666,3 +2133,4 @@ class RAGService:
             encoding="utf-8",
         )
         self._persist_documents_manifest()
+        self._invalidate_cache_version()

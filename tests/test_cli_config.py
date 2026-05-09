@@ -49,6 +49,14 @@ class CLIConfigTests(unittest.TestCase):
                 "9",
                 "--reflection",
                 "off",
+                "--cache",
+                "on",
+                "--redis-url",
+                "redis://localhost:6380/1",
+                "--cache-namespace",
+                "cli-test",
+                "--cache-retrieval-ttl",
+                "120",
             ]
         )
 
@@ -74,6 +82,10 @@ class CLIConfigTests(unittest.TestCase):
         self.assertIsNone(overrides["llm"]["timeout_s"])
         self.assertEqual(overrides["memory"]["top_k"], 9)
         self.assertFalse(overrides["agent"]["reflection_enabled"])
+        self.assertTrue(overrides["cache"]["enabled"])
+        self.assertEqual(overrides["cache"]["redis_url"], "redis://localhost:6380/1")
+        self.assertEqual(overrides["cache"]["namespace"], "cli-test")
+        self.assertEqual(overrides["cache"]["retrieval_ttl_s"], 120)
         self.assertNotIn("query_rewrite", overrides.get("retrieval", {}))
 
     def test_live_logs_alias_controls_live_events(self) -> None:

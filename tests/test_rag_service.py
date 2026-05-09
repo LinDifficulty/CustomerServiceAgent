@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from rag_server.cache_service import InMemoryJsonCache
 from rag_server.rag_service import RAGService
 
 
@@ -14,6 +16,15 @@ class FakeEmbeddings:
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [[1.0, 0.0, 0.0] for _ in texts]
+
+
+class CountingQueryEmbeddings(FakeEmbeddings):
+    def __init__(self) -> None:
+        self.query_calls = 0
+
+    def embed_query(self, text: str) -> list[float]:
+        self.query_calls += 1
+        return super().embed_query(text)
 
 
 class MultiVectorEmbeddings:
@@ -90,6 +101,24 @@ class RAGServiceTests(unittest.TestCase):
         self.assertEqual(results[0]["best_vector_type"], "keyword")
         self.assertIn("keyword", results[0]["matched_vector_types"])
         self.assertGreater(results[0]["multi_vector_scores"]["keyword"], 0.99)
+
+    def test_asearch_matches_search_result_source(self) -> None:
+        async def run_case() -> tuple[list[dict], list[dict]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_dir = Path(temp_dir) / "data"
+                doc_path = Path(temp_dir) / "doc.txt"
+                doc_path.write_text("一段可检索的尺码知识", encoding="utf-8")
+                rag = RAGService(data_dir=str(data_dir), embeddings=FakeEmbeddings())
+                rag.add_documents([str(doc_path)])
+
+                sync_results = rag.search("尺码", top_k=1)
+                async_results = await rag.asearch("尺码", top_k=1)
+                return sync_results, async_results
+
+        sync_results, async_results = asyncio.run(run_case())
+
+        self.assertEqual(len(async_results), len(sync_results))
+        self.assertEqual(async_results[0]["source"], sync_results[0]["source"])
 
     def test_parent_child_chunking_indexes_children_and_returns_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -219,6 +248,23 @@ class RAGServiceTests(unittest.TestCase):
 
             self.assertGreater(rag.index.ntotal, index_size_after_first)
             self.assertEqual(calls_after_second, 1)
+
+    def test_query_embedding_uses_cache_for_repeated_vector_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            doc_path = Path(temp_dir) / "doc.txt"
+            doc_path.write_text("一段可检索的尺码知识", encoding="utf-8")
+            embeddings = CountingQueryEmbeddings()
+            rag = RAGService(
+                data_dir=temp_dir,
+                embeddings=embeddings,
+                cache=InMemoryJsonCache(namespace="rag-test"),
+            )
+            rag.add_documents([str(doc_path)])
+
+            rag.search_by_vector("尺码", top_k=1)
+            rag.search_by_vector("尺码", top_k=1)
+
+        self.assertEqual(embeddings.query_calls, 1)
 
 
 if __name__ == "__main__":

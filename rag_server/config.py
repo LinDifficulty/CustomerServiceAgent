@@ -27,8 +27,17 @@ DEFAULT_DATA_DIR = "data"
 DEFAULT_MEMORY_DIR = "memory"
 DEFAULT_TRACE_DIR = "traces"
 DEFAULT_MCP_CONFIG_PATH = "mcp_servers.json"
-DEFAULT_LIVE_EVENTS_ENABLED = True
-DEFAULT_CLI_CONFIG_OUTPUT_ENABLED = True
+DEFAULT_LIVE_EVENTS_ENABLED = False
+DEFAULT_CLI_CONFIG_OUTPUT_ENABLED = False
+DEFAULT_CACHE_ENABLED = False
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+DEFAULT_CACHE_NAMESPACE = "rag-server"
+DEFAULT_CACHE_SOCKET_TIMEOUT_S = 0.2
+DEFAULT_QUERY_REWRITE_CACHE_TTL_S = 86400
+DEFAULT_EMBEDDING_CACHE_TTL_S = 604800
+DEFAULT_RETRIEVAL_CACHE_TTL_S = 3600
+DEFAULT_RERANK_CACHE_TTL_S = 86400
+DEFAULT_MEMORY_CACHE_TTL_S = 300
 
 
 class ConfigError(ValueError):
@@ -111,6 +120,19 @@ class CLISettings:
 
 
 @dataclass(frozen=True)
+class CacheSettings:
+    enabled: bool = DEFAULT_CACHE_ENABLED
+    redis_url: str = DEFAULT_REDIS_URL
+    namespace: str = DEFAULT_CACHE_NAMESPACE
+    socket_timeout_s: float = DEFAULT_CACHE_SOCKET_TIMEOUT_S
+    query_rewrite_ttl_s: int = DEFAULT_QUERY_REWRITE_CACHE_TTL_S
+    embedding_ttl_s: int = DEFAULT_EMBEDDING_CACHE_TTL_S
+    retrieval_ttl_s: int = DEFAULT_RETRIEVAL_CACHE_TTL_S
+    rerank_ttl_s: int = DEFAULT_RERANK_CACHE_TTL_S
+    memory_ttl_s: int = DEFAULT_MEMORY_CACHE_TTL_S
+
+
+@dataclass(frozen=True)
 class AppConfig:
     paths: PathSettings = field(default_factory=PathSettings)
     agent: AgentSettings = field(default_factory=AgentSettings)
@@ -121,6 +143,7 @@ class AppConfig:
     mcp: MCPSettings = field(default_factory=MCPSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
     cli: CLISettings = field(default_factory=CLISettings)
+    cache: CacheSettings = field(default_factory=CacheSettings)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> AppConfig:
@@ -135,6 +158,7 @@ class AppConfig:
         mcp = _mcp_settings(raw.get("mcp", {}))
         trace = _trace_settings(raw.get("trace", {}))
         cli = _cli_settings(raw.get("cli", {}))
+        cache = _cache_settings(raw.get("cache", {}))
         return cls(
             paths=paths,
             agent=agent,
@@ -145,6 +169,7 @@ class AppConfig:
             mcp=mcp,
             trace=trace,
             cli=cli,
+            cache=cache,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,6 +236,15 @@ class AppConfig:
             "agent_provider": self.agent.provider,
             "agent_model_name": self.agent.model,
             "agent_model_kwargs": dict(self.agent.model_kwargs),
+            "cache_enabled": self.cache.enabled,
+            "cache_redis_url": self.cache.redis_url,
+            "cache_namespace": self.cache.namespace,
+            "cache_socket_timeout_s": self.cache.socket_timeout_s,
+            "cache_query_rewrite_ttl_s": self.cache.query_rewrite_ttl_s,
+            "cache_embedding_ttl_s": self.cache.embedding_ttl_s,
+            "cache_retrieval_ttl_s": self.cache.retrieval_ttl_s,
+            "cache_rerank_ttl_s": self.cache.rerank_ttl_s,
+            "cache_memory_ttl_s": self.cache.memory_ttl_s,
         }
 
 
@@ -330,6 +364,17 @@ def build_env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
         "RAG_SERVER_SHOW_CONFIG": ("cli", "show_config"),
         "RAG_SERVER_CLI_SHOW_CONFIG": ("cli", "show_config"),
         "RAG_SERVER_CLI_CONFIG_OUTPUT": ("cli", "show_config"),
+        "RAG_SERVER_CACHE": ("cache", "enabled"),
+        "RAG_SERVER_CACHE_ENABLED": ("cache", "enabled"),
+        "RAG_SERVER_REDIS_URL": ("cache", "redis_url"),
+        "RAG_SERVER_CACHE_REDIS_URL": ("cache", "redis_url"),
+        "RAG_SERVER_CACHE_NAMESPACE": ("cache", "namespace"),
+        "RAG_SERVER_CACHE_SOCKET_TIMEOUT": ("cache", "socket_timeout_s"),
+        "RAG_SERVER_CACHE_QUERY_REWRITE_TTL": ("cache", "query_rewrite_ttl_s"),
+        "RAG_SERVER_CACHE_EMBEDDING_TTL": ("cache", "embedding_ttl_s"),
+        "RAG_SERVER_CACHE_RETRIEVAL_TTL": ("cache", "retrieval_ttl_s"),
+        "RAG_SERVER_CACHE_RERANK_TTL": ("cache", "rerank_ttl_s"),
+        "RAG_SERVER_CACHE_MEMORY_TTL": ("cache", "memory_ttl_s"),
     }
 
     result: dict[str, Any] = {}
@@ -585,6 +630,67 @@ def _cli_settings(raw: Any) -> CLISettings:
     )
 
 
+def _cache_settings(raw: Any) -> CacheSettings:
+    section = _section(raw, "cache")
+    _ensure_known_keys(
+        "cache",
+        section,
+        {
+            "enabled",
+            "redis_url",
+            "namespace",
+            "socket_timeout_s",
+            "query_rewrite_ttl_s",
+            "embedding_ttl_s",
+            "retrieval_ttl_s",
+            "rerank_ttl_s",
+            "memory_ttl_s",
+        },
+    )
+    default = CacheSettings()
+    return CacheSettings(
+        enabled=_coerce_bool(section.get("enabled", default.enabled), "cache.enabled"),
+        redis_url=_non_empty_str(
+            section.get("redis_url", default.redis_url),
+            "cache.redis_url",
+        ),
+        namespace=_non_empty_str(
+            section.get("namespace", default.namespace),
+            "cache.namespace",
+        ),
+        socket_timeout_s=_coerce_float(
+            section.get("socket_timeout_s", default.socket_timeout_s),
+            "cache.socket_timeout_s",
+            minimum=0.0,
+        ),
+        query_rewrite_ttl_s=_coerce_int(
+            section.get("query_rewrite_ttl_s", default.query_rewrite_ttl_s),
+            "cache.query_rewrite_ttl_s",
+            minimum=0,
+        ),
+        embedding_ttl_s=_coerce_int(
+            section.get("embedding_ttl_s", default.embedding_ttl_s),
+            "cache.embedding_ttl_s",
+            minimum=0,
+        ),
+        retrieval_ttl_s=_coerce_int(
+            section.get("retrieval_ttl_s", default.retrieval_ttl_s),
+            "cache.retrieval_ttl_s",
+            minimum=0,
+        ),
+        rerank_ttl_s=_coerce_int(
+            section.get("rerank_ttl_s", default.rerank_ttl_s),
+            "cache.rerank_ttl_s",
+            minimum=0,
+        ),
+        memory_ttl_s=_coerce_int(
+            section.get("memory_ttl_s", default.memory_ttl_s),
+            "cache.memory_ttl_s",
+            minimum=0,
+        ),
+    )
+
+
 def _normalize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     aliases = {
         ("paths", "mcp_config"): ("paths", "mcp_config_path"),
@@ -620,6 +726,12 @@ def _normalize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         ("cli", "config_output"): ("cli", "show_config"),
         ("cli", "live_events"): ("trace", "live"),
         ("cli", "live_logs"): ("trace", "live"),
+        ("cache", "url"): ("cache", "redis_url"),
+        ("cache", "ttl_query_rewrite_s"): ("cache", "query_rewrite_ttl_s"),
+        ("cache", "ttl_embedding_s"): ("cache", "embedding_ttl_s"),
+        ("cache", "ttl_retrieval_s"): ("cache", "retrieval_ttl_s"),
+        ("cache", "ttl_rerank_s"): ("cache", "rerank_ttl_s"),
+        ("cache", "ttl_memory_s"): ("cache", "memory_ttl_s"),
     }
     normalized: dict[str, Any] = {}
     for section_name, raw_section in value.items():
@@ -677,6 +789,7 @@ def _ensure_known_sections(raw: Mapping[str, Any]) -> None:
         "mcp",
         "trace",
         "cli",
+        "cache",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -17,7 +19,8 @@ import faiss
 import numpy as np
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .llm_retry import LLMRetryPolicy, invoke_with_retry
+from .cache_service import CacheTTLs, JsonCache, stable_cache_digest
+from .llm_retry import LLMRetryPolicy, ainvoke_with_retry, invoke_with_retry
 from .model_factory import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_CHAT_PROVIDER,
@@ -85,6 +88,8 @@ class MemoryService:
         embedding_model_kwargs: dict[str, Any] | None = None,
         embeddings: Any | None = None,
         trace_recorder: Any | None = None,
+        cache: JsonCache | None = None,
+        cache_ttls: dict[str, Any] | None = None,
     ) -> None:
         self.base_dir = Path(data_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -107,7 +112,10 @@ class MemoryService:
             **self.embedding_model_kwargs,
         )
         self.trace_recorder = trace_recorder
+        self.cache = cache
+        self.cache_ttls = CacheTTLs.from_mapping(cache_ttls)
         self._index_cache: dict[str, tuple[faiss.Index | None, list[str]]] = {}
+        self._lock = threading.RLock()
 
         self.conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -183,34 +191,35 @@ class MemoryService:
         if not inserted:
             return []
 
-        with self.conn:
-            self.conn.executemany(
-                """
-                INSERT INTO memories (
-                    id, user_id, content, memory_type, importance, source,
-                    metadata_json, created_at, updated_at, expires_at, deleted_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                [
-                    (
-                        item["id"],
-                        item["user_id"],
-                        item["content"],
-                        item["memory_type"],
-                        item["importance"],
-                        item["source"],
-                        json.dumps(item["metadata"], ensure_ascii=False),
-                        item["created_at"],
-                        item["updated_at"],
-                        item["expires_at"],
+        with self._lock:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO memories (
+                        id, user_id, content, memory_type, importance, source,
+                        metadata_json, created_at, updated_at, expires_at, deleted_at
                     )
-                    for item in inserted
-                ],
-            )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    [
+                        (
+                            item["id"],
+                            item["user_id"],
+                            item["content"],
+                            item["memory_type"],
+                            item["importance"],
+                            item["source"],
+                            json.dumps(item["metadata"], ensure_ascii=False),
+                            item["created_at"],
+                            item["updated_at"],
+                            item["expires_at"],
+                        )
+                        for item in inserted
+                    ],
+                )
 
-        self._rebuild_user_index(user_id)
-        return [self.get_memory(item["id"]) for item in inserted]
+            self._rebuild_user_index(user_id)
+            return [self.get_memory(item["id"]) for item in inserted]
 
     def get_memory(self, memory_id: str, user_id: str | None = None) -> dict | None:
         where = ["id = ?", "deleted_at IS NULL"]
@@ -219,10 +228,11 @@ class MemoryService:
             where.append("user_id = ?")
             params.append(user_id)
 
-        row = self.conn.execute(
-            f"SELECT * FROM memories WHERE {' AND '.join(where)}",
-            params,
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                f"SELECT * FROM memories WHERE {' AND '.join(where)}",
+                params,
+            ).fetchone()
         if row is None or self._is_expired(row):
             return None
         return self._row_to_record(row)
@@ -241,15 +251,16 @@ class MemoryService:
             where.append("(expires_at IS NULL OR expires_at > ?)")
             params.append(_utc_now())
 
-        rows = self.conn.execute(
-            f"""
-            SELECT * FROM memories
-            WHERE {' AND '.join(where)}
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            [*params, max(1, limit)],
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM memories
+                WHERE {' AND '.join(where)}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                [*params, max(1, limit)],
+            ).fetchall()
         results = [self._row_to_record(row) for row in rows]
         self._trace_event(
             "memory.list_memories",
@@ -287,6 +298,36 @@ class MemoryService:
                 reason="empty_query_or_top_k",
             )
             return []
+
+        cache_payload = self._memory_search_cache_payload(
+            user_id=user_id,
+            query=query,
+            top_k=top_k,
+            min_score=min_score,
+            allowed_types=allowed_types,
+        )
+        cached_results = self._read_cached_memory_results(cache_payload)
+        if cached_results is not None:
+            self._trace_search_memory(
+                user_id=user_id,
+                query=query,
+                top_k=top_k,
+                min_score=min_score,
+                allowed_types=allowed_types,
+                result_count=len(cached_results),
+                elapsed_ms=(time.perf_counter() - start) * 1000,
+                reason="cache_hit",
+                results=[
+                    {
+                        "id": item["id"][:8],
+                        "memory_type": item["memory_type"],
+                        "memory_layer": item.get("memory_layer"),
+                        "score": item.get("score"),
+                    }
+                    for item in cached_results
+                ],
+            )
+            return cached_results
 
         index, index_ids = self._get_user_index(user_id)
         if index is None or index.ntotal == 0:
@@ -335,6 +376,7 @@ class MemoryService:
                 break
 
         results.sort(key=lambda item: item["score"], reverse=True)
+        self._write_cached_memory_results(cache_payload, results)
         self._trace_search_memory(
             user_id=user_id,
             query=query,
@@ -411,6 +453,48 @@ class MemoryService:
         )
         return layered
 
+    async def asearch_memory_layers(
+        self,
+        user_id: str,
+        query: str,
+        *,
+        layer_top_k: dict[str, int] | None = None,
+        min_score: float = 0.0,
+    ) -> dict[str, list[dict]]:
+        """Async layered memory search with independent layers run concurrently."""
+        start = time.perf_counter()
+        limits = {**DEFAULT_MEMORY_LAYER_TOP_K, **(layer_top_k or {})}
+
+        async def search_layer(layer: str) -> tuple[str, list[dict]]:
+            results = await asyncio.to_thread(
+                self.search_memory_layer,
+                user_id,
+                query,
+                layer,
+                top_k=limits.get(layer, 3),
+                min_score=min_score,
+            )
+            return layer, results
+
+        pairs = await asyncio.gather(
+            *(search_layer(layer) for layer in MEMORY_LAYERS)
+        )
+        layered = dict(pairs)
+        self._trace_event(
+            "memory.search_memory_layers",
+            {
+                "user_id": user_id,
+                "query": query,
+                "layer_top_k": limits,
+                "min_score": min_score,
+                "layer_counts": {
+                    layer: len(items) for layer, items in layered.items()
+                },
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+            },
+        )
+        return layered
+
     def forget_memory(self, memory_id: str, user_id: str | None = None) -> bool:
         where = ["id = ?", "deleted_at IS NULL"]
         params: list[Any] = [memory_id]
@@ -418,41 +502,44 @@ class MemoryService:
             where.append("user_id = ?")
             params.append(user_id)
 
-        affected_user_ids = self._memory_user_ids(memory_id, user_id=user_id)
+        with self._lock:
+            affected_user_ids = self._memory_user_ids(memory_id, user_id=user_id)
 
-        with self.conn:
-            cursor = self.conn.execute(
-                f"""
-                UPDATE memories
-                SET deleted_at = ?, updated_at = ?
-                WHERE {' AND '.join(where)}
-                """,
-                [_utc_now(), _utc_now(), *params],
-            )
+            with self.conn:
+                cursor = self.conn.execute(
+                    f"""
+                    UPDATE memories
+                    SET deleted_at = ?, updated_at = ?
+                    WHERE {' AND '.join(where)}
+                    """,
+                    [_utc_now(), _utc_now(), *params],
+                )
 
-        if cursor.rowcount <= 0:
-            return False
-        for affected_user_id in affected_user_ids:
-            self._rebuild_user_index(affected_user_id)
-        return True
+            if cursor.rowcount <= 0:
+                return False
+            for affected_user_id in affected_user_ids:
+                self._rebuild_user_index(affected_user_id)
+            return True
 
     def clear_user_memory(self, user_id: str) -> int:
-        with self.conn:
-            cursor = self.conn.execute(
-                """
-                UPDATE memories
-                SET deleted_at = ?, updated_at = ?
-                WHERE user_id = ? AND deleted_at IS NULL
-                """,
-                [_utc_now(), _utc_now(), user_id],
-            )
+        with self._lock:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE memories
+                    SET deleted_at = ?, updated_at = ?
+                    WHERE user_id = ? AND deleted_at IS NULL
+                    """,
+                    [_utc_now(), _utc_now(), user_id],
+                )
 
-        if cursor.rowcount > 0:
-            self._rebuild_user_index(user_id)
-        return int(cursor.rowcount)
+            if cursor.rowcount > 0:
+                self._rebuild_user_index(user_id)
+            return int(cursor.rowcount)
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def _trace_event(
         self,
@@ -493,31 +580,109 @@ class MemoryService:
             payload["results"] = results
         self._trace_event("memory.search_memory", payload)
 
+    def _cache_key(self, category: str, payload: dict[str, Any]) -> str | None:
+        if self.cache is None:
+            return None
+        return self.cache.make_key(category, payload)
+
+    def _memory_search_cache_payload(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        top_k: int,
+        min_score: float,
+        allowed_types: set[str] | None,
+    ) -> dict[str, Any]:
+        return {
+            "user_id": user_id,
+            "query": query,
+            "top_k": top_k,
+            "min_score": min_score,
+            "memory_types": sorted(allowed_types) if allowed_types else None,
+            "embedding_provider": self.embedding_provider,
+            "embedding_model_name": self.embedding_model_name,
+            "embedding_config_hash": self.embedding_config_hash,
+            "memory_version": self._memory_cache_version(user_id),
+        }
+
+    def _read_cached_memory_results(
+        self,
+        payload: dict[str, Any],
+    ) -> list[dict] | None:
+        key = self._cache_key("memory_search", payload)
+        if key is None or self.cache is None:
+            return None
+        cached = self.cache.get_json(key)
+        if not isinstance(cached, list):
+            return None
+        return [dict(item) for item in cached if isinstance(item, dict)]
+
+    def _write_cached_memory_results(
+        self,
+        payload: dict[str, Any],
+        results: list[dict],
+    ) -> None:
+        key = self._cache_key("memory_search", payload)
+        if key is None or self.cache is None:
+            return
+        self.cache.set_json(key, results, ttl_s=self.cache_ttls.memory_ttl_s)
+
+    def _memory_cache_version(self, user_id: str) -> str:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_count,
+                    SUM(
+                        CASE
+                            WHEN deleted_at IS NULL
+                             AND (expires_at IS NULL OR expires_at > ?)
+                            THEN 1 ELSE 0
+                        END
+                    ) AS active_count,
+                    MAX(updated_at) AS max_updated_at,
+                    MAX(deleted_at) AS max_deleted_at
+                FROM memories
+                WHERE user_id = ?
+                """,
+                [_utc_now(), user_id],
+            ).fetchone()
+        return stable_cache_digest(
+            {
+                "total_count": int(row["total_count"] or 0),
+                "active_count": int(row["active_count"] or 0),
+                "max_updated_at": row["max_updated_at"],
+                "max_deleted_at": row["max_deleted_at"],
+            }
+        )
+
     def _init_db(self) -> None:
-        with self.conn:
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memories (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    memory_type TEXT NOT NULL,
-                    importance REAL NOT NULL,
-                    source TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    expires_at TEXT,
-                    deleted_at TEXT
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        memory_type TEXT NOT NULL,
+                        importance REAL NOT NULL,
+                        source TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        expires_at TEXT,
+                        deleted_at TEXT
+                    )
+                    """
                 )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_memories_user_active
-                ON memories(user_id, deleted_at, updated_at)
-                """
-            )
+                self.conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_memories_user_active
+                    ON memories(user_id, deleted_at, updated_at)
+                    """
+                )
 
     def _ensure_embedding_config(self) -> None:
         current = {
@@ -554,28 +719,30 @@ class MemoryService:
         }
 
     def _active_rows(self, user_id: str) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            """
-            SELECT * FROM memories
-            WHERE user_id = ?
-              AND deleted_at IS NULL
-              AND (expires_at IS NULL OR expires_at > ?)
-            ORDER BY created_at ASC
-            """,
-            [user_id, _utc_now()],
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE user_id = ?
+                  AND deleted_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY created_at ASC
+                """,
+                [user_id, _utc_now()],
+            ).fetchall()
 
     def _active_count(self, user_id: str) -> int:
-        row = self.conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM memories
-            WHERE user_id = ?
-              AND deleted_at IS NULL
-              AND (expires_at IS NULL OR expires_at > ?)
-            """,
-            [user_id, _utc_now()],
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM memories
+                WHERE user_id = ?
+                  AND deleted_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                [user_id, _utc_now()],
+            ).fetchone()
         return int(row["count"])
 
     def _memory_user_ids(self, memory_id: str, user_id: str | None = None) -> list[str]:
@@ -585,10 +752,11 @@ class MemoryService:
             where.append("user_id = ?")
             params.append(user_id)
 
-        rows = self.conn.execute(
-            f"SELECT DISTINCT user_id FROM memories WHERE {' AND '.join(where)}",
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT DISTINCT user_id FROM memories WHERE {' AND '.join(where)}",
+                params,
+            ).fetchall()
         return [str(row["user_id"]) for row in rows]
 
     def _user_index_paths(self, user_id: str) -> tuple[Path, Path]:
@@ -599,19 +767,20 @@ class MemoryService:
         )
 
     def _get_user_index(self, user_id: str) -> tuple[faiss.Index | None, list[str]]:
-        cached = self._index_cache.get(user_id)
-        if cached is None:
-            index_path, index_ids_path = self._user_index_paths(user_id)
-            index = self._load_index(index_path)
-            index_ids = self._load_index_ids(index_ids_path)
-        else:
-            index, index_ids = cached
+        with self._lock:
+            cached = self._index_cache.get(user_id)
+            if cached is None:
+                index_path, index_ids_path = self._user_index_paths(user_id)
+                index = self._load_index(index_path)
+                index_ids = self._load_index_ids(index_ids_path)
+            else:
+                index, index_ids = cached
 
-        if not self._index_matches_database(user_id, index, index_ids):
-            return self._rebuild_user_index(user_id)
+            if not self._index_matches_database(user_id, index, index_ids):
+                return self._rebuild_user_index(user_id)
 
-        self._index_cache[user_id] = (index, index_ids)
-        return index, index_ids
+            self._index_cache[user_id] = (index, index_ids)
+            return index, index_ids
 
     def _load_index(self, index_path: Path) -> faiss.Index | None:
         if not index_path.exists():
@@ -649,31 +818,69 @@ class MemoryService:
         return index.ntotal == active_count == len(index_ids)
 
     def _rebuild_user_index(self, user_id: str) -> tuple[faiss.Index | None, list[str]]:
-        index_path, index_ids_path = self._user_index_paths(user_id)
-        rows = self._active_rows(user_id)
-        if not rows:
-            if index_path.exists():
-                index_path.unlink()
-            if index_ids_path.exists():
-                index_ids_path.unlink()
-            self._index_cache[user_id] = (None, [])
-            return None, []
+        with self._lock:
+            index_path, index_ids_path = self._user_index_paths(user_id)
+            rows = self._active_rows(user_id)
+            if not rows:
+                if index_path.exists():
+                    index_path.unlink()
+                if index_ids_path.exists():
+                    index_ids_path.unlink()
+                self._index_cache[user_id] = (None, [])
+                return None, []
 
-        vectors = self._embed_texts([row["content"] for row in rows])
-        index = faiss.IndexFlatIP(vectors.shape[1])
-        index.add(vectors)
-        index_ids = [row["id"] for row in rows]
+            vectors = self._embed_texts([row["content"] for row in rows])
+            index = faiss.IndexFlatIP(vectors.shape[1])
+            index.add(vectors)
+            index_ids = [row["id"] for row in rows]
 
-        faiss.write_index(index, str(index_path))
-        self._save_index_ids(index_ids_path, index_ids)
-        self._index_cache[user_id] = (index, index_ids)
-        return index, index_ids
+            faiss.write_index(index, str(index_path))
+            self._save_index_ids(index_ids_path, index_ids)
+            self._index_cache[user_id] = (index, index_ids)
+            return index, index_ids
 
     def _embed_texts(self, texts: list[str]) -> np.ndarray:
-        vectors = self.embeddings.embed_documents(texts)
-        matrix = np.asarray(vectors, dtype="float32")
+        cached_vectors: list[list[float] | None] = [None] * len(texts)
+        missing_texts: list[str] = []
+        missing_indices: list[int] = []
+
+        for index, text in enumerate(texts):
+            key = self._embedding_cache_key(text)
+            cached = self.cache.get_json(key) if key is not None and self.cache else None
+            if isinstance(cached, list) and cached:
+                cached_vectors[index] = [float(item) for item in cached]
+            else:
+                missing_texts.append(text)
+                missing_indices.append(index)
+
+        if missing_texts:
+            vectors = self.embeddings.embed_documents(missing_texts)
+            for index, vector in zip(missing_indices, vectors, strict=False):
+                cached_vectors[index] = [float(item) for item in vector]
+
+        matrix = np.asarray(cached_vectors, dtype="float32")
         faiss.normalize_L2(matrix)
+        for index in missing_indices:
+            key = self._embedding_cache_key(texts[index])
+            if key is not None and self.cache is not None:
+                self.cache.set_json(
+                    key,
+                    matrix[index].tolist(),
+                    ttl_s=self.cache_ttls.embedding_ttl_s,
+                )
         return matrix
+
+    def _embedding_cache_key(self, text: str) -> str | None:
+        return self._cache_key(
+            "embedding",
+            {
+                "kind": "memory_text",
+                "text": text,
+                "embedding_provider": self.embedding_provider,
+                "embedding_model_name": self.embedding_model_name,
+                "embedding_config_hash": self.embedding_config_hash,
+            },
+        )
 
     def _normalize_vector_score(self, score: float) -> float:
         return max(0.0, min(1.0, (score + 1) / 2))
@@ -773,7 +980,56 @@ class LLMMemoryExtractor:
         existing_memories: list[dict] | None = None,
     ) -> list[ExtractedMemory]:
         existing_block = self._format_existing_memories(existing_memories or [])
-        messages = [
+        messages = self._build_messages(
+            user_message=user_message,
+            assistant_message=assistant_message,
+            existing_block=existing_block,
+        )
+        response = invoke_with_retry(
+            lambda: self.model.invoke(messages),
+            retry_policy=self.retry_policy,
+            operation="memory_extractor.invoke",
+            on_failure=self._trace_retry_failure,
+        )
+        payload = parse_json_object(coerce_message_content(response.content))
+        return self._normalize_memories(payload.get("memories"))
+
+    async def aextract(
+        self,
+        *,
+        user_message: str,
+        assistant_message: str,
+        existing_memories: list[dict] | None = None,
+    ) -> list[ExtractedMemory]:
+        existing_block = self._format_existing_memories(existing_memories or [])
+        messages = self._build_messages(
+            user_message=user_message,
+            assistant_message=assistant_message,
+            existing_block=existing_block,
+        )
+
+        async def invoke_model() -> Any:
+            if hasattr(self.model, "ainvoke"):
+                return await self.model.ainvoke(messages)
+            return await asyncio.to_thread(self.model.invoke, messages)
+
+        response = await ainvoke_with_retry(
+            invoke_model,
+            retry_policy=self.retry_policy,
+            operation="memory_extractor.ainvoke",
+            on_failure=self._trace_retry_failure,
+        )
+        payload = parse_json_object(coerce_message_content(response.content))
+        return self._normalize_memories(payload.get("memories"))
+
+    def _build_messages(
+        self,
+        *,
+        user_message: str,
+        assistant_message: str,
+        existing_block: str,
+    ) -> list[Any]:
+        return [
             self.system_prompt,
             HumanMessage(
                 content=(
@@ -784,14 +1040,6 @@ class LLMMemoryExtractor:
                 )
             ),
         ]
-        response = invoke_with_retry(
-            lambda: self.model.invoke(messages),
-            retry_policy=self.retry_policy,
-            operation="memory_extractor.invoke",
-            on_failure=self._trace_retry_failure,
-        )
-        payload = parse_json_object(coerce_message_content(response.content))
-        return self._normalize_memories(payload.get("memories"))
 
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
         if self.trace_recorder is None:

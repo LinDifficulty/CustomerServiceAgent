@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from typing import Any
 
+from rag_server.cache_service import InMemoryJsonCache
 from rag_server.query_rewrite import LLMQueryRewriter, QueryRewriteResult
 
 
@@ -54,6 +56,17 @@ class LLMQueryRewriterTests(unittest.TestCase):
         self.assertGreater(len(result.search_queries), 0)
         self.assertIn(result.rewritten_query, result.search_queries)
 
+    def test_arewrite_returns_structured_result(self) -> None:
+        async def run_case() -> QueryRewriteResult:
+            rewriter = LLMQueryRewriter(model=FakeRewriteModel())
+            return await rewriter.arewrite("160cm 95斤穿什么码？")
+
+        result = asyncio.run(run_case())
+
+        self.assertIsInstance(result, QueryRewriteResult)
+        self.assertEqual(result.original_query, "160cm 95斤穿什么码？")
+        self.assertIn("身高160cm", result.rewritten_query)
+
     def test_rewrite_with_empty_response_falls_back_to_original(self) -> None:
         rewriter = LLMQueryRewriter(model=EmptyRewriteModel())
         result = rewriter.rewrite("原始问题")
@@ -103,6 +116,30 @@ class LLMQueryRewriterTests(unittest.TestCase):
         result = rewriter.rewrite("原始")
 
         self.assertLessEqual(len(result.search_queries), 3)
+
+    def test_rewrite_uses_cache_for_repeated_query(self) -> None:
+        class CountingModel:
+            calls = 0
+
+            def invoke(self, messages: Any) -> Any:
+                self.calls += 1
+
+                class R:
+                    content = (
+                        '{"rewritten_query":"缓存查询",'
+                        '"search_queries":["缓存查询"],"notes":[]}'
+                    )
+                return R()
+
+        model = CountingModel()
+        cache = InMemoryJsonCache(namespace="rewrite-test")
+        rewriter = LLMQueryRewriter(model=model, cache=cache)
+
+        first = rewriter.rewrite("重复问题")
+        second = rewriter.rewrite("重复问题")
+
+        self.assertEqual(first.rewritten_query, second.rewritten_query)
+        self.assertEqual(model.calls, 1)
 
 
 if __name__ == "__main__":

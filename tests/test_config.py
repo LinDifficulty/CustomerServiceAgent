@@ -8,6 +8,14 @@ from rag_server.config import ConfigError, load_app_config
 
 
 class AppConfigTests(unittest.TestCase):
+    def test_cli_noise_defaults_are_off(self) -> None:
+        config = load_app_config()
+
+        self.assertFalse(config.trace.live)
+        self.assertFalse(config.cli.show_config)
+        self.assertFalse(config.to_runtime_kwargs()["live_events_enabled"])
+        self.assertFalse(config.to_runtime_kwargs()["show_config"])
+
     def test_loads_defaults_file_env_and_overrides_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "rag.toml"
@@ -69,6 +77,7 @@ class AppConfigTests(unittest.TestCase):
             self.assertTrue(config.trace.enabled)
             self.assertFalse(config.trace.live)
             self.assertFalse(config.cli.show_config)
+            self.assertFalse(config.cache.enabled)
 
             runtime = config.to_runtime_kwargs()
             self.assertEqual(runtime["data_dir"], "from_env_data")
@@ -81,6 +90,7 @@ class AppConfigTests(unittest.TestCase):
             self.assertTrue(runtime["reflection_enabled"])
             self.assertFalse(runtime["live_events_enabled"])
             self.assertFalse(runtime["show_config"])
+            self.assertFalse(runtime["cache_enabled"])
 
     def test_rejects_unknown_keys(self) -> None:
         with self.assertRaises(ConfigError):
@@ -136,6 +146,33 @@ class AppConfigTests(unittest.TestCase):
             runtime["rewrite_model_kwargs"]["base_url"],
             "https://example.test/v1",
         )
+
+    def test_cache_config_from_env_and_overrides(self) -> None:
+        config = load_app_config(
+            env={
+                "RAG_SERVER_CACHE": "on",
+                "RAG_SERVER_REDIS_URL": "redis://localhost:6380/2",
+                "RAG_SERVER_CACHE_NAMESPACE": "test-rag",
+                "RAG_SERVER_CACHE_RETRIEVAL_TTL": "120",
+            },
+            overrides={
+                "cache": {
+                    "embedding_ttl_s": 30,
+                    "memory_ttl_s": 5,
+                }
+            },
+        )
+
+        runtime = config.to_runtime_kwargs()
+
+        self.assertTrue(config.cache.enabled)
+        self.assertEqual(config.cache.redis_url, "redis://localhost:6380/2")
+        self.assertEqual(config.cache.namespace, "test-rag")
+        self.assertEqual(config.cache.retrieval_ttl_s, 120)
+        self.assertEqual(config.cache.embedding_ttl_s, 30)
+        self.assertEqual(config.cache.memory_ttl_s, 5)
+        self.assertTrue(runtime["cache_enabled"])
+        self.assertEqual(runtime["cache_namespace"], "test-rag")
 
 
 if __name__ == "__main__":

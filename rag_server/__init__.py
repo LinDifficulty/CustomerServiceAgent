@@ -1,5 +1,6 @@
 """Reusable RAG and ecommerce agent components."""
 
+from .cache_service import InMemoryJsonCache, JsonCache, RedisJsonCache
 from .config import AppConfig, ConfigError, load_app_config
 from .eval_service import evaluate_retrieval_dataset, load_retrieval_eval_dataset
 from .llm_retry import LLMRetryError, LLMRetryPolicy
@@ -15,6 +16,8 @@ from .trace_service import TraceRecorder, load_trace, summarize_trace
 __all__ = [
     "AppConfig",
     "ConfigError",
+    "InMemoryJsonCache",
+    "JsonCache",
     "LLMQueryRewriter",
     "LLMMemoryExtractor",
     "LLMRetryError",
@@ -26,6 +29,7 @@ __all__ = [
     "MemoryService",
     "QueryRewriteResult",
     "RAGService",
+    "RedisJsonCache",
     "ReflectionAgent",
     "ReflectionResult",
     "SkillDefinition",

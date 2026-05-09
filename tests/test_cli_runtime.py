@@ -19,6 +19,7 @@ from rag_server.cli import (
     build_retrieval_tool_with_rewrite,
     handle_shortcuts_command,
     handle_unknown_slash_command,
+    is_cli_clear_command,
     is_cli_exit_command,
     prompt_toolkit_slash_matches,
     run_cli_async,
@@ -28,6 +29,16 @@ from rag_server.cli import (
 class FakeStreamingApp:
     async def astream(self, state, stream_mode):
         yield {"agent": {"messages": [AIMessage(content="正常回答")]}}
+        yield {"save_memory": None}
+
+
+class FakeHistoryInspectingApp:
+    def __init__(self) -> None:
+        self.history_lengths: list[int] = []
+
+    async def astream(self, state, stream_mode):
+        self.history_lengths.append(len(state.get("messages", [])))
+        yield {"agent": {"messages": [AIMessage(content="回答")]}}
         yield {"save_memory": None}
 
 
@@ -149,12 +160,28 @@ class FakePromptToolkitSession:
         return "/memory"
 
 
+def run_async_case(coro) -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 class CLIRuntimeTests(unittest.TestCase):
     def test_exit_command_aliases(self) -> None:
         for value in ("exit", "quit", "/exit", "/quit", "退出", "/退出", " EXIT "):
             self.assertTrue(is_cli_exit_command(value))
 
         self.assertFalse(is_cli_exit_command("/memory"))
+
+    def test_clear_command_aliases(self) -> None:
+        for value in ("clear", "/clear", "清空", "/清空", " CLEAR "):
+            self.assertTrue(is_cli_clear_command(value))
+
+        self.assertFalse(is_cli_clear_command("/clear-memory"))
 
     def test_cli_view_uses_compact_terminal_header_and_prompt(self) -> None:
         view = CLIView(style=CLIStyle(enabled=False), width=52)
@@ -194,7 +221,7 @@ class CLIRuntimeTests(unittest.TestCase):
             )
 
         output = stdout.getvalue()
-        self.assertIn("RAG Server v", output)
+        self.assertIn("Tulip Agent v", output)
         self.assertIn("tongyi:qwen-test · API Usage", output)
         self.assertIn("skills:0 · mcp:0", output)
         self.assertIn("? for shortcuts", output)
@@ -212,6 +239,7 @@ class CLIRuntimeTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIn("Shortcuts", output)
         self.assertIn("输入 / 会自动显示可用命令", output)
+        self.assertIn("clear / /clear", output)
         self.assertIn("/memory", output)
         self.assertIn("/size-guide", output)
         self.assertIn("exit / quit", output)
@@ -223,6 +251,7 @@ class CLIRuntimeTests(unittest.TestCase):
         ]
 
         self.assertIn("/memory", commands)
+        self.assertIn("/clear", commands)
         self.assertIn("/remember-procedure", commands)
         self.assertIn("/size-guide", commands)
 
@@ -367,26 +396,20 @@ class CLIRuntimeTests(unittest.TestCase):
             patch("builtins.input", side_effect=lambda prompt="": next(inputs)),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(
-                    run_cli_async(
-                        query_rewrite_mode="off",
-                        memory_enabled=False,
-                        skills_enabled=False,
-                        mcp_enabled=False,
-                        trace_enabled=False,
-                        live_events_enabled=False,
-                        show_config=False,
-                    )
+            run_async_case(
+                run_cli_async(
+                    query_rewrite_mode="off",
+                    memory_enabled=False,
+                    skills_enabled=False,
+                    mcp_enabled=False,
+                    trace_enabled=False,
+                    live_events_enabled=False,
+                    show_config=False,
                 )
-            finally:
-                loop.close()
-                asyncio.set_event_loop(asyncio.new_event_loop())
+            )
 
         output = stdout.getvalue()
-        self.assertIn("RAG Server", output)
+        self.assertIn("Tulip Agent", output)
         self.assertIn("Assistant\n正常回答", output)
         self.assertIn("正常回答", output)
         self.assertNotIn("客服:", output)
@@ -409,28 +432,51 @@ class CLIRuntimeTests(unittest.TestCase):
             patch("builtins.input", side_effect=lambda prompt="": next(inputs)),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(
-                    run_cli_async(
-                        query_rewrite_mode="off",
-                        memory_enabled=False,
-                        skills_enabled=False,
-                        mcp_enabled=False,
-                        trace_enabled=False,
-                        live_events_enabled=False,
-                        show_config=False,
-                    )
+            run_async_case(
+                run_cli_async(
+                    query_rewrite_mode="off",
+                    memory_enabled=False,
+                    skills_enabled=False,
+                    mcp_enabled=False,
+                    trace_enabled=False,
+                    live_events_enabled=False,
+                    show_config=False,
                 )
-            finally:
-                loop.close()
-                asyncio.set_event_loop(asyncio.new_event_loop())
+            )
 
         output = stdout.getvalue()
         self.assertIn("第一轮回答", output)
         self.assertIn("第二轮历史正常", output)
         self.assertNotIn("大模型调用失败", output)
+
+    def test_clear_command_resets_conversation_history(self) -> None:
+        inputs = iter(["第一轮", "clear", "第二轮", "exit"])
+        app = FakeHistoryInspectingApp()
+
+        with (
+            patch("rag_server.cli.RAGService", return_value=object()),
+            patch(
+                "rag_server.cli.build_agent",
+                return_value=(app, object(), SystemMessage(content="")),
+            ),
+            patch("builtins.input", side_effect=lambda prompt="": next(inputs)),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            run_async_case(
+                run_cli_async(
+                    query_rewrite_mode="off",
+                    memory_enabled=False,
+                    skills_enabled=False,
+                    mcp_enabled=False,
+                    trace_enabled=False,
+                    live_events_enabled=False,
+                    show_config=False,
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertEqual(app.history_lengths, [1, 1])
+        self.assertIn("Session context cleared.", output)
 
     def test_live_event_format_uses_tool_blocks(self) -> None:
         output = format_cli_live_event(

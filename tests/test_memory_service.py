@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
-from pathlib import Path
 from typing import Any
 
 from rag_server.cache_service import InMemoryJsonCache

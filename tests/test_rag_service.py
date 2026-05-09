@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +57,26 @@ class ExplodingEmbeddings:
 
 
 class RAGServiceTests(unittest.TestCase):
+    def test_jieba_initialization_logs_are_silenced(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from rag_server.rag_service import jieba\n"
+                    "list(jieba.lcut_for_search('中文关键词测试'))\n"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Building prefix dict", result.stderr)
+        self.assertNotIn("Loading model from cache", result.stderr)
+        self.assertNotIn("Prefix dict has been built successfully", result.stderr)
+
     def test_cross_encoder_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             rag = RAGService(data_dir=temp_dir, embeddings=FakeEmbeddings())
@@ -237,7 +259,6 @@ class RAGServiceTests(unittest.TestCase):
             try:
                 rag = RAGService(data_dir=temp_dir, embeddings=FakeEmbeddings())
                 rag.add_documents([str(doc1)])
-                calls_after_first = len(embed_calls)
                 index_size_after_first = rag.index.ntotal
 
                 embed_calls.clear()

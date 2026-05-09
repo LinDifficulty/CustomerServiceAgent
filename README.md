@@ -1,4 +1,4 @@
-# RAG Server
+# Tulip Agent
 
 本地可复用的中文 RAG / 智能体组件库，当前面向电商客服知识库场景。
 

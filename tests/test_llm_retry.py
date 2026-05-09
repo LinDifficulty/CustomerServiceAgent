@@ -158,7 +158,7 @@ class AsyncInvokeWithRetryTests(unittest.TestCase):
 
             return await ainvoke_with_retry(success)
 
-        result = asyncio.get_event_loop().run_until_complete(go())
+        result = asyncio.run(go())
         self.assertEqual(result, 42)
 
     def test_async_retries(self) -> None:
@@ -177,7 +177,7 @@ class AsyncInvokeWithRetryTests(unittest.TestCase):
             policy = LLMRetryPolicy(max_attempts=3, initial_backoff_s=0.01)
             return await ainvoke_with_retry(flaky, retry_policy=policy)
 
-        result = asyncio.get_event_loop().run_until_complete(go())
+        result = asyncio.run(go())
         self.assertEqual(result, "ok")
         self.assertEqual(call_count, 2)
 

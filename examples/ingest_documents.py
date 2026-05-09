@@ -10,9 +10,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from rag_server import RAGService
-from rag_server.model_factory import DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_PROVIDER
-from rag_server.rag_service import SUPPORTED_EXTENSIONS
+from rag_server import RAGService  # noqa: E402
+from rag_server.model_factory import (  # noqa: E402
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+)
+from rag_server.rag_service import SUPPORTED_EXTENSIONS  # noqa: E402
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

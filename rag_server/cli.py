@@ -79,13 +79,19 @@ DEFAULT_MAX_TOOL_ROUNDS = 6
 DEFAULT_MAX_REPEATED_TOOL_CALLS = 2
 DEFAULT_REFLECTION_ENABLED = True
 CLI_EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", "退出", "/退出"}
+CLI_CLEAR_COMMANDS = {"clear", "/clear", "清空", "/清空"}
+CLI_DISPLAY_NAME = "Tulip Agent"
 CLI_PACKAGE_NAME = "rag-server"
 CLI_VERSION_FALLBACK = "0.1.0"
 CLI_LOGO = [
-    "  ██████  ",
-    "██  ██  ██",
-    "██████████",
-    "  ██  ██  ",
+    ("   ██████   ", "purple"),
+    ("███  ██  ███", "purple"),
+    ("████████████", "purple"),
+    ("   ██████   ", "purple"),
+    ("     ██     ", "green"),
+    ("███  ██  ███", "green"),
+    ("  ████████  ", "green"),
+    ("     ██     ", "green"),
 ]
 MEMORY_SLASH_COMMANDS = {
     "/memory",
@@ -113,6 +119,7 @@ class SlashCommandSpec:
 BUILTIN_SLASH_COMMANDS = (
     SlashCommandSpec("/exit", "/exit", "结束会话", "Session"),
     SlashCommandSpec("/quit", "/quit", "结束会话", "Session"),
+    SlashCommandSpec("/clear", "/clear", "清空当前会话上下文", "Session"),
     SlashCommandSpec("/help", "/help", "显示快捷帮助", "Session"),
     SlashCommandSpec("/memory", "/memory", "查看长期记忆", "Memory"),
     SlashCommandSpec("/remember", "/remember <内容>", "记录长期偏好或指令", "Memory"),
@@ -155,6 +162,10 @@ def is_cli_exit_command(value: str) -> bool:
     return value.strip().casefold() in CLI_EXIT_COMMANDS
 
 
+def is_cli_clear_command(value: str) -> bool:
+    return value.strip().casefold() in CLI_CLEAR_COMMANDS
+
+
 def cli_version() -> str:
     try:
         return version(CLI_PACKAGE_NAME)
@@ -170,6 +181,13 @@ def should_use_cli_color(stream: Any | None = None) -> bool:
         return True
     target = stream if stream is not None else sys.stdout
     return bool(getattr(target, "isatty", lambda: False)())
+
+
+def clear_terminal_startup(stream: Any | None = None) -> None:
+    target = stream if stream is not None else sys.stdout
+    if not getattr(target, "isatty", lambda: False)():
+        return
+    os.system("clear")
 
 
 def terminal_width(default: int = 88) -> int:
@@ -200,6 +218,8 @@ class CLIStyle:
     PROMPT = "\033[1;37m"
     MUTED = "\033[38;5;244m"
     ACCENT = "\033[38;5;173m"
+    LOGO_PURPLE = "\033[38;5;177m"
+    LOGO_GREEN = "\033[38;5;113m"
     WARNING = "\033[38;5;178m"
     ERROR = "\033[38;5;203m"
 
@@ -217,8 +237,12 @@ class CLIStyle:
     def dim(self, text: str) -> str:
         return self.apply(text, self.MUTED)
 
-    def accent(self, text: str) -> str:
-        return self.apply(text, self.ACCENT)
+    def logo(self, text: str, color: str) -> str:
+        styles = {
+            "purple": self.LOGO_PURPLE,
+            "green": self.LOGO_GREEN,
+        }
+        return self.apply(text, styles.get(color, self.ACCENT))
 
     def warning(self, text: str) -> str:
         return self.apply(text, self.WARNING)
@@ -259,41 +283,6 @@ def format_tongyi_error(
         )
 
     return f"大模型调用失败：{error!r}"
-
-
-def build_retrieval_tool(
-    rag: RAGService,
-    *,
-    query_rewrite_mode: str = DEFAULT_QUERY_REWRITE_MODE,
-    rewrite_provider: str = DEFAULT_CHAT_PROVIDER,
-    rewrite_model_name: str = DEFAULT_AGENT_MODEL,
-    rewrite_model_kwargs: dict[str, Any] | None = None,
-    llm_retry_policy: LLMRetryPolicy | None = None,
-    trace_recorder: TraceRecorder | None = None,
-    cache: JsonCache | None = None,
-    cache_ttls: dict[str, int] | None = None,
-):
-    actual_mode = normalize_query_rewrite_mode(query_rewrite_mode)
-    actual_cache_ttls = cache_ttls or {}
-    rewriter = (
-        LLMQueryRewriter(
-            provider=rewrite_provider,
-            model_name=rewrite_model_name,
-            model_kwargs=rewrite_model_kwargs,
-            trace_recorder=trace_recorder,
-            retry_policy=llm_retry_policy,
-            cache=cache,
-            cache_ttl_s=actual_cache_ttls.get("query_rewrite_ttl_s", 86400),
-        )
-        if actual_mode != "off"
-        else None
-    )
-    return build_retrieval_tool_with_rewrite(
-        rag,
-        query_rewrite_mode=actual_mode,
-        rewriter=rewriter,
-        trace_recorder=trace_recorder,
-    )
 
 
 async def _rag_search_async(rag: Any, **kwargs: Any) -> list[dict]:
@@ -748,12 +737,6 @@ def available_slash_command_specs(
     return sorted(specs, key=lambda item: (item.category, item.command))
 
 
-def slash_command_names(
-    skill_registry: SkillRegistry | None = None,
-) -> list[str]:
-    return [item.command for item in available_slash_command_specs(skill_registry)]
-
-
 def is_potential_slash_command(value: str) -> bool:
     token = value.strip().split(maxsplit=1)[0] if value.strip() else ""
     return bool(token.startswith("/") and SLASH_COMMAND_TOKEN_PATTERN.fullmatch(token))
@@ -1064,7 +1047,7 @@ class CLIView:
         mcp_tools: list[BaseTool],
         cwd: Path,
     ) -> None:
-        title = self.style.bold("RAG Server")
+        title = self.style.bold(CLI_DISPLAY_NAME)
         title_line = f"{title} {self.style.dim('v' + cli_version())}"
         model_line = self.style.dim(
             f"{agent_provider}:{agent_model_name} · API Usage · "
@@ -1079,8 +1062,8 @@ class CLIView:
         header_lines = [title_line, model_line, tool_line, cwd_line]
 
         self._print()
-        for index, logo_line in enumerate(CLI_LOGO):
-            logo = self.style.accent(logo_line)
+        for index, (logo_line, logo_color) in enumerate(CLI_LOGO):
+            logo = self.style.logo(logo_line, logo_color)
             suffix = header_lines[index] if index < len(header_lines) else ""
             self._print(f"{logo}  {suffix}".rstrip())
         self._print()
@@ -1271,6 +1254,9 @@ class CLIView:
     def print_exit(self) -> None:
         self._print(f"\n{self.style.dim('Session ended.')}")
 
+    def print_clear(self) -> None:
+        self._print(f"\n{self.style.dim('Session context cleared.')}")
+
     def print_command_result(self, title: str, body: str) -> None:
         self._print()
         self._print(self.style.bold(title))
@@ -1301,25 +1287,6 @@ MEMORY_LAYER_LABELS = {
     "episode": "历史事件摘要",
     "procedure": "可复用流程记忆",
 }
-
-
-def format_memory_context(memories: list[dict]) -> str:
-    if not memories:
-        return ""
-
-    blocks: list[str] = []
-    for index, item in enumerate(memories, start=1):
-        blocks.append(
-            "\n".join(
-                [
-                    f"记忆{index}",
-                    f"类型: {item['memory_type']}",
-                    f"重要性: {item['importance']:.2f}",
-                    f"内容: {item['content']}",
-                ]
-            )
-        )
-    return "\n\n".join(blocks)
 
 
 def format_layered_memory_context(layered_memories: dict[str, list[dict]]) -> str:
@@ -1379,6 +1346,7 @@ def format_shortcuts_help(
     )
     sections = [
         "输入 / 会自动显示可用命令；继续输入前缀会实时缩小候选范围。",
+        "clear / /clear    清空当前会话上下文",
         "exit / quit / 退出  结束会话",
         "? / help          显示快捷帮助",
     ]
@@ -2426,6 +2394,18 @@ async def run_cli_async(
                 break
             if not user_input:
                 continue
+            if is_cli_clear_command(user_input):
+                messages = []
+                view.print_clear()
+                if trace_recorder is not None:
+                    trace_recorder.event(
+                        "agent",
+                        "agent.session_context_cleared",
+                        {
+                            "user_id": user_id,
+                        },
+                    )
+                continue
             if handle_shortcuts_command(user_input, view, skill_registry):
                 continue
             if handle_memory_command(user_input, memory_service, user_id, view):
@@ -3009,6 +2989,7 @@ def main(argv: list[str] | None = None) -> None:
     except ConfigError as error:
         raise SystemExit(f"配置错误: {error}") from error
 
+    clear_terminal_startup()
     run_cli(**config.to_runtime_kwargs())
 
 

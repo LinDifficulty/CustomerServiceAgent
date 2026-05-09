@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from typing import Any
 
 from rag_server.utils import coerce_bool, coerce_message_content, parse_json_object
 

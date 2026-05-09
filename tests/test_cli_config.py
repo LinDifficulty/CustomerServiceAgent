@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 
-from rag_server.cli import build_cli_overrides, parse_args
+from rag_server.cli import build_cli_overrides, clear_terminal_startup, main, parse_args
 
 
 class CLIConfigTests(unittest.TestCase):
@@ -97,6 +98,52 @@ class CLIConfigTests(unittest.TestCase):
         overrides = build_cli_overrides(parse_args([]))
 
         self.assertEqual(overrides, {})
+
+    def test_clear_terminal_startup_uses_system_clear_for_tty(self) -> None:
+        stream = Mock()
+        stream.isatty.return_value = True
+
+        with patch("rag_server.cli.os.system") as system:
+            clear_terminal_startup(stream)
+
+        system.assert_called_once_with("clear")
+
+    def test_clear_terminal_startup_skips_non_tty(self) -> None:
+        stream = Mock()
+        stream.isatty.return_value = False
+
+        with patch("rag_server.cli.os.system") as system:
+            clear_terminal_startup(stream)
+
+        system.assert_not_called()
+
+    def test_main_clears_terminal_after_config_load_before_cli_run(self) -> None:
+        calls: list[str] = []
+        config = Mock()
+        config.to_runtime_kwargs.return_value = {"query_rewrite_mode": "off"}
+
+        def fake_load_app_config(*args, **kwargs):
+            calls.append("load_config")
+            return config
+
+        def fake_clear_terminal_startup():
+            calls.append("clear")
+
+        def fake_run_cli(**kwargs):
+            calls.append("run_cli")
+
+        with (
+            patch("rag_server.cli.load_app_config", side_effect=fake_load_app_config),
+            patch(
+                "rag_server.cli.clear_terminal_startup",
+                side_effect=fake_clear_terminal_startup,
+            ),
+            patch("rag_server.cli.run_cli", side_effect=fake_run_cli),
+        ):
+            main([])
+
+        self.assertEqual(calls, ["load_config", "clear", "run_cli"])
+        config.to_runtime_kwargs.assert_called_once_with()
 
 
 if __name__ == "__main__":

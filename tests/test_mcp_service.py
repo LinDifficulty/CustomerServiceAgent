@@ -4,7 +4,6 @@ import json
 import os
 import tempfile
 import unittest
-from pathlib import Path
 
 from rag_server.mcp_service import (
     _expand_env_vars,

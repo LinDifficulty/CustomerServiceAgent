@@ -5,7 +5,6 @@ import unittest
 from pathlib import Path
 
 from rag_server.skill_service import (
-    SkillDefinition,
     SkillRegistry,
     _parse_frontmatter,
     _safe_child_path,

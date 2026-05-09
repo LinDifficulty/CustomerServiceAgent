@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 import warnings
@@ -36,6 +37,8 @@ with warnings.catch_warnings():
         category=UserWarning,
     )
     import jieba
+
+jieba.setLogLevel(logging.WARNING)
 
 # 支持的文档格式集合，仅处理这些扩展名的文件。
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
@@ -1651,12 +1654,6 @@ class RAGService:
             for token in jieba.lcut_for_search(text)
             if token.strip()
         ]
-
-    def _vector_score_map(self, query: str, limit: int) -> dict[int, float]:
-        return {
-            idx: float(details["score"])
-            for idx, details in self._vector_score_details_map(query, limit).items()
-        }
 
     def _vector_score_details_map(self, query: str, limit: int) -> dict[int, dict]:
         if self.index.ntotal == 0:

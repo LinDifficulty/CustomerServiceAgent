@@ -11,27 +11,41 @@ from .rag_service import RAGService
 from .trace_service import TraceRecorder, preview_text, summarize_result
 from .utils import coerce_bool, coerce_message_content, parse_json_object
 
+# 默认使用与 Agent 对话模型相同的模型进行反思审校
 DEFAULT_REFLECTION_MODEL = DEFAULT_CHAT_MODEL
 
 
 @dataclass(frozen=True)
 class ReflectionResult:
-    """Structured judgment produced by the reflection model."""
+    """反思审校的结构化判断结果，由反思模型生成。
 
-    has_hallucination: bool
-    needs_more_evidence: bool
-    reason: str
-    search_query: str
-    correction_guidance: str
-    raw_response: str
+    包含幻觉判断、证据充分性评估、修正建议等关键字段，
+    用于驱动后续的补充检索和回答修正流程。
+    """
+
+    has_hallucination: bool       # 初次回答是否包含未被证据支持的幻觉内容
+    needs_more_evidence: bool     # 是否需要补充更多证据来支撑回答
+    reason: str                   # 一句话说明审校结论的原因
+    search_query: str             # 如果需要补检索，此字段包含精简的检索问题
+    correction_guidance: str      # 如果需要修正，说明应该删除或修改什么内容
+    raw_response: str             # LLM 返回的原始文本，便于调试追踪
 
     @property
     def needs_revision(self) -> bool:
+        """回答是否需要修正：存在幻觉 或 需要补充证据时都需要修正。"""
         return self.has_hallucination or self.needs_more_evidence
 
 
 class ReflectionAgent:
-    """Review an answer, retrieve more evidence if needed, then revise it."""
+    """反思审校 Agent：审查初次回答质量，必要时补充证据并修正回答。
+
+    工作流程：
+    1. reflect：审校初次回答，判断是否有幻觉或证据不足
+    2. 如果不需要修正，直接返回原始回答
+    3. 如果需要修正，进行补充检索获取更多证据
+    4. revise：基于原有证据和补充证据，修正回答
+    5. 如果任一环节失败，安全回退到原始回答
+    """
 
     def __init__(
         self,
@@ -46,7 +60,9 @@ class ReflectionAgent:
         supplemental_top_k: int = 3,
         supplemental_candidate_top_k: int = 10,
     ) -> None:
+        # RAG 检索服务，用于补充检索
         self.rag = rag
+        # 模型配置
         self.provider = provider
         self.model_name = model_name
         self.model_kwargs = dict(model_kwargs or {})
@@ -55,8 +71,11 @@ class ReflectionAgent:
             model_name=model_name,
             **self.model_kwargs,
         )
+        # 重试策略：LLM 调用失败时的重试控制
         self.retry_policy = retry_policy or LLMRetryPolicy()
+        # 追踪记录器
         self.trace_recorder = trace_recorder
+        # 补充检索参数：检索多少条和候选多少条
         self.supplemental_top_k = supplemental_top_k
         self.supplemental_candidate_top_k = supplemental_candidate_top_k
 
@@ -69,10 +88,16 @@ class ReflectionAgent:
         memory_context: str = "",
         skill_context: str = "",
     ) -> str:
-        """Run reflection; return the original or revised answer."""
+        """主流程：审校初次回答，必要时修正并返回最终回答。
+
+        整个流程为异步，任何步骤失败都会安全回退到原始回答，
+        不会因反思本身的问题而中断用户请求。
+        """
+        # 空输入保护：如果问题或回答为空，直接返回原始回答
         if not user_question.strip() or not initial_answer.strip():
             return initial_answer
 
+        # 步骤 1：审校初次回答
         try:
             reflection = await self.reflect(
                 user_question=user_question,
@@ -82,6 +107,7 @@ class ReflectionAgent:
                 skill_context=skill_context,
             )
         except Exception as error:
+            # 审校失败时记录告警并安全回退
             self._trace_event(
                 "reflection.reflect_failed",
                 {"error": repr(error), "question": user_question},
@@ -89,12 +115,15 @@ class ReflectionAgent:
             )
             return initial_answer
 
+        # 步骤 2：如果不需要修正，直接返回原始回答
         if not reflection.needs_revision:
             return initial_answer
 
+        # 步骤 3：需要修正，先进行补充检索获取更多证据
         supplemental_context = self._supplemental_retrieval(
             reflection.search_query or user_question
         )
+        # 如果补充检索也没有获取到任何证据，记录告警并回退
         if not supplemental_context and not evidence_context:
             self._trace_event(
                 "reflection.no_evidence_for_revision",
@@ -106,6 +135,7 @@ class ReflectionAgent:
             )
             return initial_answer
 
+        # 步骤 4：基于证据修正回答
         try:
             return await self.revise(
                 user_question=user_question,
@@ -115,6 +145,7 @@ class ReflectionAgent:
                 supplemental_context=supplemental_context,
             )
         except Exception as error:
+            # 修正失败时记录告警并安全回退
             self._trace_event(
                 "reflection.revision_failed",
                 {"error": repr(error), "question": user_question},
@@ -131,6 +162,12 @@ class ReflectionAgent:
         memory_context: str = "",
         skill_context: str = "",
     ) -> ReflectionResult:
+        """审校初次回答：调用 LLM 判断是否存在幻觉或证据不足。
+
+        通过精心设计的提示词，让 LLM 以严格的客服审校角色审视回答，
+        区分证据（商品事实）和记忆上下文（用户偏好），
+        避免将用户偏好误认为事实依据。
+        """
         messages = [
             SystemMessage(
                 content=(
@@ -159,14 +196,17 @@ class ReflectionAgent:
                 )
             ),
         ]
+        # 使用带重试机制的异步 LLM 调用
         response = await ainvoke_with_retry(
             lambda: self.model.ainvoke(messages),
             retry_policy=self.retry_policy,
             operation="reflection.reflect",
             on_failure=self._trace_retry_failure,
         )
+        # 从 LLM 返回的 JSON 中解析结构化审校结果
         raw_response = coerce_message_content(response.content)
         result = parse_reflection_result(raw_response)
+        # 记录审校完成追踪事件
         self._trace_event(
             "reflection.reflect",
             {
@@ -189,6 +229,12 @@ class ReflectionAgent:
         evidence_context: str,
         supplemental_context: str,
     ) -> str:
+        """基于审校结论和补充证据修正回答。
+
+        将审校结论（是否有幻觉、缺少什么证据、修正建议）和补充检索到的证据
+        一起提供给 LLM，让它生成修正后的最终回复。
+        要求 LLM 以客服身份直接输出，不暴露内部审校过程。
+        """
         messages = [
             SystemMessage(
                 content=(
@@ -212,6 +258,7 @@ class ReflectionAgent:
                 )
             ),
         ]
+        # 带重试的异步 LLM 调用
         response = await ainvoke_with_retry(
             lambda: self.model.ainvoke(messages),
             retry_policy=self.retry_policy,
@@ -219,6 +266,7 @@ class ReflectionAgent:
             on_failure=self._trace_retry_failure,
         )
         revised_answer = coerce_message_content(response.content).strip()
+        # 记录修正完成追踪事件
         self._trace_event(
             "reflection.revise",
             {
@@ -226,12 +274,19 @@ class ReflectionAgent:
                 "revised_preview": preview_text(revised_answer),
             },
         )
+        # 如果修正后的回答为空，回退到原始回答
         return revised_answer or initial_answer
 
     def _supplemental_retrieval(self, query: str) -> str:
+        """根据审校推荐的检索问题，从知识库中补充检索证据。
+
+        如果检索失败或返回空结果，记录告警并返回空字符串，
+        不会中断主流程。
+        """
         if not query.strip():
             return ""
         try:
+            # 使用基础检索方法（不使用 BM25 和 rerank，保持快速）
             results = self.rag.search(
                 query=query,
                 top_k=self.supplemental_top_k,
@@ -245,6 +300,7 @@ class ReflectionAgent:
             )
             return ""
 
+        # 将检索结果格式化为可读的文本上下文
         context = format_retrieval_results(results)
         self._trace_event(
             "reflection.supplemental_retrieval",
@@ -260,6 +316,10 @@ class ReflectionAgent:
         return context
 
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
+        """记录 LLM 调用重试失败事件。
+
+        根据是否会继续重试使用不同的日志级别（warning/error）。
+        """
         self._trace_event(
             "reflection.model_retry",
             {"provider": self.provider, "model_name": self.model_name, **event},
@@ -273,16 +333,25 @@ class ReflectionAgent:
         *,
         level: str = "info",
     ) -> None:
+        """统一的追踪事件记录方法。
+
+        封装了对 trace_recorder 的判空逻辑，避免重复的 None 检查。
+        """
         if self.trace_recorder is None:
             return
         self.trace_recorder.event("reflection", name, payload, level=level)
 
 
 def parse_reflection_result(raw_response: str) -> ReflectionResult:
+    """从 LLM 返回的原始 JSON 字符串中解析出结构化的审校结果。
+
+    使用 parse_json_object 安全解析 JSON，给每个字段提供默认值，
+    避免因 LLM 输出格式不规范导致解析失败。
+    """
     payload = parse_json_object(raw_response)
     return ReflectionResult(
-        has_hallucination=_coerce_bool(payload.get("has_hallucination")),
-        needs_more_evidence=_coerce_bool(payload.get("needs_more_evidence")),
+        has_hallucination=coerce_bool(payload.get("has_hallucination")),
+        needs_more_evidence=coerce_bool(payload.get("needs_more_evidence")),
         reason=str(payload.get("reason") or ""),
         search_query=str(payload.get("search_query") or ""),
         correction_guidance=str(payload.get("correction_guidance") or ""),
@@ -291,10 +360,15 @@ def parse_reflection_result(raw_response: str) -> ReflectionResult:
 
 
 def format_retrieval_results(results: list[dict]) -> str:
+    """将检索结果列表格式化为结构化的文本块，用于作为 LLM 提示词的上下文。
+
+    每个结果包含序号、来源文件名和内容，结果之间用双换行分隔。
+    """
     if not results:
         return ""
 
     blocks: list[str] = []
+    # 从 1 开始编号，便于 LLM 理解和引用
     for index, item in enumerate(results, start=1):
         blocks.append(
             "\n".join(
@@ -306,7 +380,3 @@ def format_retrieval_results(results: list[dict]) -> str:
             )
         )
     return "\n\n".join(blocks)
-
-
-def _coerce_bool(value: Any) -> bool:
-    return coerce_bool(value)

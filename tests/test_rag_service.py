@@ -1,3 +1,11 @@
+"""RAGService 单元测试。
+
+测试文档入库、FAISS 向量索引构建、BM25 关键词召回、
+多向量检索（关键词向量 + 摘要向量）、父子分块（parent-child chunking）、
+幂等入库（内容哈希去重）、增量入库、跨编码器默认禁用、
+以及查询向量缓存等核心 RAG 功能。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +20,7 @@ from rag_server.cache_service import InMemoryJsonCache
 from rag_server.rag_service import RAGService
 
 
+# 用于测试的模拟嵌入类——返回固定向量，避免调用真实 API
 class FakeEmbeddings:
     def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0, 0.0]
@@ -20,6 +29,7 @@ class FakeEmbeddings:
         return [[1.0, 0.0, 0.0] for _ in texts]
 
 
+# 计数嵌入类——记录 embed_query 调用次数，用于验证查询缓存是否生效
 class CountingQueryEmbeddings(FakeEmbeddings):
     def __init__(self) -> None:
         self.query_calls = 0
@@ -29,6 +39,7 @@ class CountingQueryEmbeddings(FakeEmbeddings):
         return super().embed_query(text)
 
 
+# 多向量嵌入类——根据文本内容返回不同的向量，模拟关键词向量和摘要向量的多向量搜索场景
 class MultiVectorEmbeddings:
     def embed_query(self, text: str) -> list[float]:
         if "靛蓝独有词" in text:
@@ -48,15 +59,20 @@ class MultiVectorEmbeddings:
         return [0.0, 1.0, 0.0]
 
 
+class EmbeddingShouldNotBeCalled(Exception):
+    """Raised to verify empty RAGService init does not call embedding methods."""
+
+
 class ExplodingEmbeddings:
     def embed_query(self, text: str) -> list[float]:
-        raise AssertionError("empty RAGService init should not embed a probe query")
+        raise EmbeddingShouldNotBeCalled("empty RAGService init should not embed a probe query")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        raise AssertionError("empty RAGService init should not embed documents")
+        raise EmbeddingShouldNotBeCalled("empty RAGService init should not embed documents")
 
 
 class RAGServiceTests(unittest.TestCase):
+    # 测试 jieba 分词初始化日志已被静默，确保终端没有多余输出
     def test_jieba_initialization_logs_are_silenced(self) -> None:
         result = subprocess.run(
             [
@@ -77,18 +93,21 @@ class RAGServiceTests(unittest.TestCase):
         self.assertNotIn("Loading model from cache", result.stderr)
         self.assertNotIn("Prefix dict has been built successfully", result.stderr)
 
+    # 验证跨编码器默认不启用，避免首次运行时自动下载大模型
     def test_cross_encoder_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             rag = RAGService(data_dir=temp_dir, embeddings=FakeEmbeddings())
 
         self.assertFalse(rag.default_use_rerank)
 
+    # 验证空的 RAGService 初始化不会触发嵌入调用（无文档则不建索引）
     def test_empty_init_does_not_call_embedding_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             rag = RAGService(data_dir=temp_dir, embeddings=ExplodingEmbeddings())
 
         self.assertEqual(rag.index.ntotal, 0)
 
+    # 验证空初始化后添加文档能正确构建 FAISS 索引（索引维度 = 3，总向量数 = 3）
     def test_add_documents_after_empty_init_builds_real_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             doc_path = Path(temp_dir) / "doc.txt"
@@ -101,6 +120,7 @@ class RAGServiceTests(unittest.TestCase):
         self.assertEqual(rag.index.d, 3)
         self.assertEqual(rag.index.ntotal, 3)
 
+    # 验证多向量检索：包含关键词的查询优先使用关键词向量（best_vector_type=keyword）进行召回
     def test_multi_vector_retrieval_uses_keyword_embedding(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir) / "data"
@@ -124,6 +144,7 @@ class RAGServiceTests(unittest.TestCase):
         self.assertIn("keyword", results[0]["matched_vector_types"])
         self.assertGreater(results[0]["multi_vector_scores"]["keyword"], 0.99)
 
+    # 验证异步搜索 asearch 的结果与同步搜索 search 的结果一致
     def test_asearch_matches_search_result_source(self) -> None:
         async def run_case() -> tuple[list[dict], list[dict]]:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -142,6 +163,7 @@ class RAGServiceTests(unittest.TestCase):
         self.assertEqual(len(async_results), len(sync_results))
         self.assertEqual(async_results[0]["source"], sync_results[0]["source"])
 
+    # 验证父子分块：子块被索引、搜索返回父块，且子块内容含在 child_content 中
     def test_parent_child_chunking_indexes_children_and_returns_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             doc_path = Path(temp_dir) / "doc.txt"
@@ -172,6 +194,7 @@ class RAGServiceTests(unittest.TestCase):
         self.assertEqual(results[0]["metadata"]["parent_index"], 0)
         self.assertIn("child_chunk_id", results[0]["metadata"])
 
+    # 验证父子分块去重：多个子块命中同一个父块时，结果按父块去重只返回一条
     def test_parent_child_results_are_deduplicated_by_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             doc_path = Path(temp_dir) / "doc.txt"
@@ -197,6 +220,7 @@ class RAGServiceTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("same parent tail", results[0]["content"])
 
+    # 验证旧格式 metadata.json 能自动迁移重建 FAISS 索引和 documents.json
     def test_legacy_metadata_rebuilds_persistent_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
@@ -223,6 +247,7 @@ class RAGServiceTests(unittest.TestCase):
             )
             self.assertEqual(len(documents_payload["documents"]), 1)
 
+    # 验证幂等入库：相同内容不重复入库；内容变更后自动更新并重新索引
     def test_add_documents_is_idempotent_and_updates_changed_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             doc_path = Path(temp_dir) / "doc.txt"
@@ -241,6 +266,7 @@ class RAGServiceTests(unittest.TestCase):
             self.assertEqual(third["added_chunks"], 1)
             self.assertIn(str(doc_path), third["updated_documents"])
 
+    # 验证增量入库：新增文档仅嵌入新增块，不会触发全量重建
     def test_incremental_add_extends_index_without_full_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             doc1 = Path(temp_dir) / "doc1.txt"
@@ -270,6 +296,7 @@ class RAGServiceTests(unittest.TestCase):
             self.assertGreater(rag.index.ntotal, index_size_after_first)
             self.assertEqual(calls_after_second, 1)
 
+    # 验证查询向量缓存：相同查询词的向量搜索命中缓存，降低 embedding API 调用次数
     def test_query_embedding_uses_cache_for_repeated_vector_search(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             doc_path = Path(temp_dir) / "doc.txt"

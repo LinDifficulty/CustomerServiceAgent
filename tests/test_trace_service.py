@@ -1,3 +1,10 @@
+"""Trace 服务单元测试。
+
+测试 TraceRecorder 的 JSONL 记录写入、敏感字段脱敏（REDACTED）、
+事件和指标记录、关闭文件追踪时的事件槽机制（event_sinks）、
+以及轨迹加载和汇总（load_trace / summarize_trace）。
+"""
+
 from __future__ import annotations
 
 import tempfile
@@ -12,6 +19,7 @@ from rag_server.trace_service import (
 
 
 class TraceServiceTests(unittest.TestCase):
+    # 验证写入的 JSONL 记录中对敏感字段（api_key, password, Authorization）进行了脱敏
     def test_writes_redacted_jsonl_records(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = TraceRecorder(
@@ -36,6 +44,7 @@ class TraceServiceTests(unittest.TestCase):
         self.assertEqual(records[0]["payload"]["nested"]["password"], REDACTED_VALUE)
         self.assertEqual(records[0]["payload"]["nested"]["safe"], "value")
 
+    # 验证事件记录和指标（metric）写入后，summarize_trace 能正确统计数量
     def test_metric_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = TraceRecorder(trace_dir=temp_dir, run_id="summary")
@@ -51,6 +60,7 @@ class TraceServiceTests(unittest.TestCase):
         self.assertEqual(summary["event_types"]["metric"], 1)
         self.assertIn("latency_ms", summary["top_names"])
 
+    # 验证关闭文件追踪（enabled=False）时，event_sinks 仍能收到记录
     def test_event_sinks_receive_records_when_file_trace_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             seen = []

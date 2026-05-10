@@ -1,3 +1,9 @@
+"""反思服务单元测试。
+
+测试反思结果解析（从 JSON 块提取幻觉检测）、检索结果格式化、
+以及 Agent 端的反思流程——检测幻觉并自动修正最终回答。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +18,7 @@ from rag_server.reflection_service import (
 )
 
 
+# 模拟反思模型——首轮返回含幻觉的回答，第二轮返回 JSON 反思结果，第三轮修正回答
 class FakeReflectionModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -36,6 +43,7 @@ class FakeReflectionModel:
         return AIMessage(content="目前知识库没有库存信息，我无法确认是否有现货。")
 
 
+# 模拟 RAG 服务——总返回无库存信息的检索结果
 class FakeRAG:
     def search(self, query: str, top_k: int = 3, candidate_top_k: int | None = None):
         return [
@@ -50,6 +58,7 @@ class FakeRAG:
 
 
 class ReflectionServiceTests(unittest.TestCase):
+    # 验证从混合文本中提取 JSON 块的反思结果（含幻觉、需额外证据、需修正）
     def test_parse_reflection_result_from_json_block(self) -> None:
         result = parse_reflection_result(
             """
@@ -69,6 +78,7 @@ class ReflectionServiceTests(unittest.TestCase):
         self.assertTrue(result.needs_revision)
         self.assertEqual(result.search_query, "160cm 95斤 尺码")
 
+    # 验证非 JSON 输入返回安全的默认值（无幻觉、无需额外证据、无需修正）
     def test_parse_reflection_result_defaults_to_no_revision(self) -> None:
         result = parse_reflection_result("不是 JSON")
 
@@ -76,6 +86,7 @@ class ReflectionServiceTests(unittest.TestCase):
         self.assertFalse(result.needs_more_evidence)
         self.assertFalse(result.needs_revision)
 
+    # 验证检索结果格式化输出包含片段编号、来源和内容
     def test_format_retrieval_results(self) -> None:
         formatted = format_retrieval_results(
             [
@@ -90,6 +101,7 @@ class ReflectionServiceTests(unittest.TestCase):
         self.assertIn("docs/尺码推荐.txt", formatted)
         self.assertIn("建议 S 码", formatted)
 
+    # 端到端验证反思流程：Agent 检测到幻觉后，最终输出应移除幻觉内容（如库存承诺）
     def test_agent_reflection_revises_final_answer(self) -> None:
         async def run_case() -> str:
             app, _, _ = build_agent(

@@ -1150,6 +1150,13 @@ class CLIView:
     def _divider(self) -> str:
         return self.style.dim("-" * self.width)
 
+    @staticmethod
+    def _visible_center(text: str, width: int) -> str:
+        """Center *text* within *width* columns, ignoring ANSI escape sequences."""
+        visible = re.sub(r"\033\[[0-9;]*m", "", text)
+        pad = max(0, (width - len(visible)) // 2)
+        return " " * pad + text
+
     def _status(self, label: str, enabled: bool, extra: str | None = None) -> str:
         state = "on" if enabled else "off"
         text = f"{label}:{state}"
@@ -1196,10 +1203,28 @@ class CLIView:
         header_lines = [title_line, model_line, tool_line, cwd_line]
 
         self._print()
-        for index, (logo_line, logo_color) in enumerate(CLI_LOGO):
-            logo = self.style.logo(logo_line, logo_color)
-            suffix = header_lines[index] if index < len(header_lines) else ""
-            self._print(f"{logo}  {suffix}".rstrip())
+
+        _ansi_re = r"\033\[[0-9;]*m"
+        _max_text_w = max(
+            (len(re.sub(_ansi_re, "", line)) for line in header_lines),
+            default=0,
+        )
+        _logo_total = 14  # 12 char logo + 2 space gap
+
+        if self.width >= _logo_total + _max_text_w:
+            # Wide terminal: side-by-side layout (original behavior)
+            for index, (logo_line, logo_color) in enumerate(CLI_LOGO):
+                logo = self.style.logo(logo_line, logo_color)
+                suffix = header_lines[index] if index < len(header_lines) else ""
+                self._print(f"{logo}  {suffix}".rstrip())
+        else:
+            # Narrow terminal: stacked layout — centered logo on top, text below
+            for logo_line, logo_color in CLI_LOGO:
+                self._print(self._visible_center(self.style.logo(logo_line, logo_color), self.width))
+            self._print()
+            for line in header_lines:
+                self._print(self._visible_center(line, self.width))
+
         self._print()
         self._print(self._divider())
         self._print(self.style.dim("? for shortcuts · exit / quit / 退出 to end"))
@@ -1400,13 +1425,12 @@ class CLIView:
             self._print(self.style.dim(f"  {line}") if line else "")
 
     def begin_assistant(self) -> None:
-        self._print()
         self._print(self.style.bold("Assistant"))
 
-    def start_thinking(self, text: str = "正在分析问题...") -> "CLIThinkingIndicator":
+    def start_thinking(self, text: str = "正在分析问题...", *, newline: bool = False) -> "CLIThinkingIndicator":
         indicator = CLIThinkingIndicator(self, text=text)
         self._thinking_indicator = indicator
-        indicator.start()
+        indicator.start(newline=newline)
         return indicator
 
     def update_thinking(self, text: str) -> None:
@@ -1439,7 +1463,7 @@ class CLIThinkingIndicator:
     """Small same-line thinking animation for interactive terminals."""
 
     DEFAULT_TEXT = "正在分析问题..."
-    DOT_FRAMES = (".  ", ".. ", "...")
+    SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     COLOR_STYLES = (
         CLIStyle.ACCENT,
         CLIStyle.LOGO_GREEN,
@@ -1463,12 +1487,13 @@ class CLIThinkingIndicator:
         self._color_index = 0
         self._frame_index = 0
 
-    def start(self) -> None:
+    def start(self, *, newline: bool = False) -> None:
         self.interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
         self.active = True
-        self.view._print()
+        if newline:
+            self.view._print()
         if not self.interactive:
-            self.view._print(self.view.style.dim(self.static_text()), flush=True)
+            self.view._print(self.view.style.apply(self.static_text(), CLIStyle.LOGO_GREEN), flush=True)
             return
         self.render()
         try:
@@ -1480,7 +1505,7 @@ class CLIThinkingIndicator:
     async def _animate(self) -> None:
         try:
             while self.active:
-                self._frame_index = (self._frame_index + 1) % len(self.DOT_FRAMES)
+                self._frame_index = (self._frame_index + 1) % len(self.SPINNER_FRAMES)
                 if self._frame_index == 0:
                     self._color_index = (
                         self._color_index + 1
@@ -1491,10 +1516,10 @@ class CLIThinkingIndicator:
             return
 
     def current_text(self) -> str:
-        return f"{self.text}{self.DOT_FRAMES[self._frame_index]}"
+        return f"{self.SPINNER_FRAMES[self._frame_index]} {self.text}"
 
     def static_text(self) -> str:
-        return f"{self.text}..."
+        return f"✓ {self.text}"
 
     def update(self, text: str) -> None:
         normalized = text.rstrip(".")
@@ -1505,7 +1530,7 @@ class CLIThinkingIndicator:
         if self.interactive:
             self.render()
         else:
-            self.view._print(self.view.style.dim(self.static_text()), flush=True)
+            self.view._print(self.view.style.apply(self.static_text(), CLIStyle.LOGO_GREEN), flush=True)
 
     def clear_line(self) -> None:
         if self.interactive:
@@ -1516,7 +1541,7 @@ class CLIThinkingIndicator:
             return
         color = self.COLOR_STYLES[self._color_index]
         frame = self.view.style.apply(self.current_text(), color)
-        print(f"\r{frame}", end="", flush=True)
+        print(f"\r\033[K{frame}", end="", flush=True)
 
     async def stop(self) -> None:
         if not self.active:
@@ -1529,7 +1554,11 @@ class CLIThinkingIndicator:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        self.clear_line()
+        if self.interactive:
+            text = self.view.style.apply(f"✓ {self.text}", CLIStyle.LOGO_GREEN)
+            print(f"\r\033[K{text}", end="", flush=True)
+        else:
+            self.clear_line()
         if self.view._thinking_indicator is self:
             self.view._thinking_indicator = None
 
@@ -1822,6 +1851,8 @@ def build_agent(
     output_delta_sink: Callable[[str], Any] | None = None,
     cache: JsonCache | None = None,
     cache_ttls: dict[str, int] | None = None,
+    view: CLIView | None = None,
+    assistant_container: dict[str, Any] | None = None,
 ):
     actual_query_rewrite_mode = normalize_query_rewrite_mode(query_rewrite_mode)
     retry_policy = llm_retry_policy or LLMRetryPolicy()
@@ -2041,6 +2072,7 @@ def build_agent(
         if should_stream_output:
             chunks: list[AIMessageChunk] = []
             emitted_content = ""
+            has_tool_calls = False
             response: Any = None
             try:
                 async for chunk in model.astream(model_messages):
@@ -2048,16 +2080,13 @@ def build_agent(
                         response = chunk
                         break
                     chunks.append(chunk)
+                    if chunk.tool_calls or chunk.tool_call_chunks:
+                        has_tool_calls = True
+                        continue
                     content = coerce_message_content(chunk.content)
                     if not content:
                         continue
-                    if chunk.tool_calls or chunk.tool_call_chunks:
-                        if emitted_content:
-                            sys.stdout.write("\r\033[K")
-                            sys.stdout.flush()
-                        emitted_content = ""
-                        continue
-                    if any(item.tool_calls or item.tool_call_chunks for item in chunks):
+                    if has_tool_calls:
                         continue
                     await maybe_emit_output_delta(output_delta_sink, content)
                     emitted_content += content
@@ -2067,10 +2096,7 @@ def build_agent(
                 if emitted_content:
                     sys.stdout.write("\r\033[K")
                     sys.stdout.flush()
-                has_tool_call_chunks = any(
-                    item.tool_calls or item.tool_call_chunks for item in chunks
-                )
-                if not has_tool_call_chunks:
+                if not has_tool_calls:
                     if trace_recorder is not None:
                         trace_recorder.event(
                             "model",
@@ -2110,6 +2136,20 @@ def build_agent(
                 operation="agent.model_ainvoke",
                 on_failure=trace_model_retry_failure,
             )
+        # 显示工具调用前的中间文本（non-streaming 路径）
+        if (
+            view is not None
+            and isinstance(response, AIMessage)
+            and response.tool_calls
+        ):
+            answer = coerce_message_content(response.content).strip()
+            if answer:
+                view._print()
+                view.begin_assistant()
+                view.print_assistant_delta(answer)
+                view.end_assistant()
+                if assistant_container is not None:
+                    assistant_container["started"] = True
         if trace_recorder is not None:
             trace_recorder.event(
                 "model",
@@ -2720,6 +2760,7 @@ async def run_cli_async(
             },
         )
     output_delta_dispatcher = OutputDeltaDispatcher()
+    assistant_container: dict[str, Any] = {"started": False}
     app, model, system_prompt = build_agent(
         rag,
         query_rewrite_mode=actual_query_rewrite_mode,
@@ -2744,6 +2785,7 @@ async def run_cli_async(
         output_delta_sink=output_delta_dispatcher,
         cache=cache,
         cache_ttls=cache_ttls,
+        assistant_container=assistant_container,
     )
     messages: list[BaseMessage] = []
 
@@ -2843,6 +2885,7 @@ async def run_cli_async(
                 turn_messages: list[BaseMessage] = []
                 stream_sink_used = False
                 stream_final_message_seen = False
+                assistant_container["started"] = False
 
                 async def print_stream_delta(text: str) -> None:
                     nonlocal assistant_started, stream_sink_used
@@ -2856,7 +2899,20 @@ async def run_cli_async(
                     view.print_assistant_delta(text)
                     stream_sink_used = True
 
+                def tool_progress_text(tool_names: list[str]) -> str:
+                    """Generate a human-readable progress message for the given tool names."""
+                    categories = set()
+                    for name in tool_names:
+                        if name == "search_product_knowledge":
+                            categories.add("搜索知识库")
+                        elif name in {"load_skill", "read_skill_file"}:
+                            categories.add("加载技能")
+                        else:
+                            categories.add("调用工具")
+                    return "正在" + "、".join(sorted(categories)) + "..."
+
                 output_delta_dispatcher.sink = print_stream_delta
+                tool_thinking_active = False
                 async for event in app.astream(
                     {
                         "messages": input_messages,
@@ -2870,11 +2926,28 @@ async def run_cli_async(
                         node_messages = coerce_graph_messages(
                             node_output.get("messages")
                         )
+
+                        # When tools node finishes, stop the tool thinking indicator
+                        if node_name == "tools" and tool_thinking_active:
+                            await thinking_indicator.stop()
+                            tool_thinking_active = False
+
                         turn_messages.extend(node_messages)
                         for msg in node_messages:
                             if not isinstance(msg, AIMessage):
                                 continue
                             if msg.tool_calls:
+                                # Agent decided to call tools — show tool-specific progress
+                                names = [
+                                    tc.get("name", "")
+                                    for tc in msg.tool_calls
+                                ]
+                                await thinking_indicator.stop()
+                                thinking_indicator = view.start_thinking(
+                                    tool_progress_text(names),
+                                    newline=assistant_started,
+                                )
+                                tool_thinking_active = True
                                 continue
                             content = coerce_message_content(msg.content).strip()
                             if content and content != streamed_content:
@@ -2895,6 +2968,9 @@ async def run_cli_async(
                                     view.print_assistant_delta(new_text)
                                 streamed_content = content
                                 final_message = msg
+                if tool_thinking_active:
+                    await thinking_indicator.stop()
+                    tool_thinking_active = False
                 if streamed_content or stream_sink_used:
                     view.end_assistant()
             except Exception as error:
@@ -2947,7 +3023,7 @@ async def run_cli_async(
                     final_message = last
 
             if isinstance(final_message, AIMessage):
-                if not streamed_content:
+                if not streamed_content and not assistant_container.get("started"):
                     if not assistant_started:
                         view.update_thinking("正在组织答案...")
                         await thinking_indicator.stop()

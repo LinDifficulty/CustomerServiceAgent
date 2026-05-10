@@ -215,6 +215,37 @@ class FakePrefaceThenToolErrorModel:
         return AIMessage(content="兜底回答")
 
 
+class FakePrefaceThenToolSuccessModel:
+    """Streaming model: preface text then tool call, then final answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, tools):
+        return self
+
+    async def astream(self, messages, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            yield AIMessageChunk(content="让我搜索一下")
+            yield AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {
+                        "name": "search_product_knowledge",
+                        "args": '{"question":"测试"}',
+                        "id": "call-1",
+                        "index": 0,
+                    }
+                ],
+            )
+            return
+        yield AIMessageChunk(content="最终回答")
+
+    async def ainvoke(self, messages):
+        return AIMessage(content="最终回答")
+
+
 class FakeBadSkillToolArgsModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -529,7 +560,7 @@ class CLIRuntimeTests(unittest.TestCase):
         self.assertEqual(streamed, "工具后回答")
         self.assertEqual(final, "工具后回答")
 
-    def test_agent_does_not_stream_preface_before_tool_call_is_confirmed(self) -> None:
+    def test_agent_streams_preface_before_tool_call_and_keeps_it(self) -> None:
         async def run_case() -> list[str]:
             deltas: list[str] = []
             app, _, _ = build_agent(
@@ -554,8 +585,36 @@ class CLIRuntimeTests(unittest.TestCase):
 
         deltas = asyncio.run(run_case())
 
-        # 前置引导文本在 tool call 出现前已发送到 sink，随后 ANSI 退格清除。
+        # 前置引导文本在 tool call 出现前已发送到 sink 并保留显示。
         self.assertEqual("".join(deltas), "我先查一下")
+
+    def test_agent_streams_preface_and_final_answer_through_tool_loop(self) -> None:
+        async def run_case() -> tuple[str, str]:
+            deltas: list[str] = []
+            app, _, _ = build_agent(
+                SyncOnlyRAG(),
+                query_rewrite_mode="off",
+                skills_enabled=False,
+                memory_service=None,
+                memory_extractor=None,
+                agent_model=FakePrefaceThenToolSuccessModel(),
+                reflection_enabled=False,
+                stream_output_enabled=True,
+                output_delta_sink=deltas.append,
+            )
+            result = await app.ainvoke(
+                {
+                    "messages": [HumanMessage(content="测试")],
+                    "user_id": "user",
+                }
+            )
+            return "".join(deltas), result["messages"][-1].content
+
+        streamed, final = asyncio.run(run_case())
+
+        # 前置引导文本和最终回答都应保留在 stream 中
+        self.assertEqual(streamed, "让我搜索一下最终回答")
+        self.assertEqual(final, "最终回答")
 
     def test_missing_skill_file_path_feedback_is_returned_to_model_for_repair(self) -> None:
         async def run_case() -> tuple[str, list[ToolMessage]]:
@@ -742,7 +801,7 @@ class CLIRuntimeTests(unittest.TestCase):
             with patch("sys.stdout", stream):
                 indicator.start()
                 indicator.update("找到相关知识...")
-                await asyncio.sleep(0.006)
+                await asyncio.sleep(0.012)
                 await indicator.stop()
             return stream.getvalue()
 
@@ -844,8 +903,8 @@ class CLIRuntimeTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertIn("Tulip Agent", output)
-        self.assertIn("正在分析问题...", output)
-        self.assertIn("正在组织答案...", output)
+        self.assertIn("正在分析问题", output)
+        self.assertIn("正在组织答案", output)
         self.assertIn("Assistant\n正常回答", output)
         self.assertIn("正常回答", output)
         self.assertNotIn("客服:", output)
@@ -1044,10 +1103,10 @@ class CLIRuntimeTests(unittest.TestCase):
             )
 
         output = stdout.getvalue()
-        self.assertIn("正在分析问题...", output)
-        self.assertIn("正在检索相关知识...", output)
-        self.assertIn("找到相关知识...", output)
-        self.assertIn("正在组织答案...", output)
+        self.assertIn("正在分析问题", output)
+        self.assertIn("正在检索相关知识", output)
+        self.assertIn("找到相关知识", output)
+        self.assertIn("正在搜索知识库", output)
         self.assertIn("Assistant\n工具后回答", output)
         self.assertNotIn("- RAG", output)
         self.assertNotIn("大模型调用失败", output)

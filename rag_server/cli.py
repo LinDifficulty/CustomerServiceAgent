@@ -1885,7 +1885,7 @@ class CLIThinkingIndicator:
         if self.interactive:
             # 交互式环境：用绿色 ✓ 替换 spinner
             text = self.view.style.apply(f"✓ {self.text}", CLIStyle.LOGO_GREEN)
-            print(f"\r\033[K{text}", end="", flush=True)
+            print(f"\r\033[K{text}\n", end="", flush=True)
         else:
             self.clear_line()
         # 清理视图对当前 indicator 的引用

@@ -47,6 +47,7 @@ uv run python main.py
 - `MemoryService`：按 `user_id` 隔离的长期记忆
 - `SkillRegistry`：Anthropic 风格 `SKILL.md` 技能加载
 - `MCP Client`：把 MCP 服务器工具接成 LangChain 工具
+- `JsonCache`：Redis / 内存缓存，加速重复查询
 - `TraceRecorder`：JSONL 链路追踪
 - `eval_runner`：检索评测和指标输出
 
@@ -121,8 +122,11 @@ uv run rag-cli --user-id user_001
 # 启用 MCP 工具
 uv run rag-cli --mcp on --mcp-config ./mcp_servers.json
 
-# 启用 Redis 缓存
-uv run rag-cli --cache on --redis-url redis://localhost:6379/0
+# 关闭 Redis 缓存（默认开启）
+uv run rag-cli --cache off
+
+# 指定 Redis 地址
+uv run rag-cli --redis-url redis://localhost:6379/0
 ```
 
 常用开关：
@@ -138,6 +142,7 @@ uv run rag-cli --cache on --redis-url redis://localhost:6379/0
 - `--live-events on|off`
 - `--show-config on|off`
 - `--stream-output on|off`
+- `--cache on|off`
 
 CLI 内置命令：
 
@@ -221,6 +226,19 @@ uv run rag-cli --trace on --trace-dir traces
 
 CLI 默认开启回答流式输出。需要关闭时使用 `--stream-output off`，或设置 `RAG_SERVER_STREAM_OUTPUT=off`。
 
+### 缓存
+
+Redis 缓存默认开启，会缓存 query rewrite、embedding、检索结果、rerank 结果和记忆检索。Redis 连接失败时自动降级为无缓存模式。
+
+关闭缓存或自定义 Redis 地址：
+
+```bash
+uv run rag-cli --cache off
+uv run rag-cli --redis-url redis://your-redis:6379/0
+```
+
+各 TTL 可通过 `--cache-query-rewrite-ttl`、`--cache-embedding-ttl` 等参数调整。
+
 ### 检索评测
 
 ```bash
@@ -242,9 +260,11 @@ uv run python -m rag_server.eval_runner \
 ├── docs/                    # 示例知识库
 ├── data/                    # 本地索引与元数据
 ├── evals/                   # 检索评测数据
+├── prompts/                 # 系统提示词模板
 ├── examples/                # 示例脚本
 ├── tests/                   # 单元测试
 ├── main.py                  # 兼容 CLI 入口
+├── mcp_servers.json         # MCP 配置（默认空）
 ├── mcp_servers.example.json # MCP 配置模板
 ├── pyproject.toml
 └── 项目技术文档.md

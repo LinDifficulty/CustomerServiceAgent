@@ -91,7 +91,7 @@ enabled = true
             self.assertFalse(config.trace.live)
             self.assertFalse(config.cli.show_config)
             self.assertFalse(config.cli.stream_output)
-            self.assertFalse(config.cache.enabled)
+            self.assertTrue(config.cache.enabled)
 
             # 验证 to_runtime_kwargs 转换的正确性
             runtime = config.to_runtime_kwargs()
@@ -107,7 +107,7 @@ enabled = true
             self.assertFalse(runtime["live_events_enabled"])
             self.assertFalse(runtime["show_config"])
             self.assertFalse(runtime["stream_output_enabled"])
-            self.assertFalse(runtime["cache_enabled"])
+            self.assertTrue(runtime["cache_enabled"])
 
     def test_rejects_unknown_keys(self) -> None:
         """传入未知的配置键时应抛出 ConfigError 异常。"""

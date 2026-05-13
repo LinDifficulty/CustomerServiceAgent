@@ -50,25 +50,23 @@ class MultiVectorEmbeddings:
         return [self._embed_text(text) for text in texts]
 
     def _embed_text(self, text: str) -> list[float]:
-        if text.startswith("关键词:") and (
-            "靛蓝独有词" in text or ("靛蓝" in text and "独有" in text)
-        ):
+        if text.startswith("关键词:") and ("靛蓝独有词" in text or ("靛蓝" in text and "独有" in text)):
             return [1.0, 0.0, 0.0]
         if text.startswith("摘要:"):
             return [0.0, 0.0, 1.0]
         return [0.0, 1.0, 0.0]
 
 
-class EmbeddingShouldNotBeCalled(Exception):
+class EmbeddingShouldNotBeCalledError(Exception):
     """Raised to verify empty RAGService init does not call embedding methods."""
 
 
 class ExplodingEmbeddings:
     def embed_query(self, text: str) -> list[float]:
-        raise EmbeddingShouldNotBeCalled("empty RAGService init should not embed a probe query")
+        raise EmbeddingShouldNotBeCalledError("empty RAGService init should not embed a probe query")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        raise EmbeddingShouldNotBeCalled("empty RAGService init should not embed documents")
+        raise EmbeddingShouldNotBeCalledError("empty RAGService init should not embed documents")
 
 
 class RAGServiceTests(unittest.TestCase):
@@ -78,10 +76,7 @@ class RAGServiceTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                (
-                    "from rag_server.rag_service import jieba\n"
-                    "list(jieba.lcut_for_search('中文关键词测试'))\n"
-                ),
+                ("from rag_server.rag_service import jieba\nlist(jieba.lcut_for_search('中文关键词测试'))\n"),
             ],
             capture_output=True,
             text=True,
@@ -199,10 +194,7 @@ class RAGServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             doc_path = Path(temp_dir) / "doc.txt"
             doc_path.write_text(
-                "repeat first child detail. "
-                "repeat second child detail. "
-                "repeat third child detail. "
-                "same parent tail.",
+                "repeat first child detail. repeat second child detail. repeat third child detail. same parent tail.",
                 encoding="utf-8",
             )
             rag = RAGService(
@@ -242,9 +234,7 @@ class RAGServiceTests(unittest.TestCase):
             RAGService(data_dir=temp_dir, embeddings=FakeEmbeddings())
 
             self.assertTrue((data_dir / "faiss.index").exists())
-            documents_payload = json.loads(
-                (data_dir / "documents.json").read_text(encoding="utf-8")
-            )
+            documents_payload = json.loads((data_dir / "documents.json").read_text(encoding="utf-8"))
             self.assertEqual(len(documents_payload["documents"]), 1)
 
     # 验证幂等入库：相同内容不重复入库；内容变更后自动更新并重新索引

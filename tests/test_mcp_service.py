@@ -25,23 +25,23 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def _write_config(self, data: dict) -> str:
         """Write JSON config to a temp file and return its path."""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump(data, f)
             return f.name
 
     def test_loads_servers_from_servers_key(self) -> None:
         """从 "servers" 键下加载服务器连接配置。"""
-        path = self._write_config({
-            "servers": {
-                "my-server": {
-                    "transport": "stdio",
-                    "command": "echo",
-                    "args": ["hello"],
+        path = self._write_config(
+            {
+                "servers": {
+                    "my-server": {
+                        "transport": "stdio",
+                        "command": "echo",
+                        "args": ["hello"],
+                    }
                 }
             }
-        })
+        )
         config = load_mcp_config(path)
         os.unlink(path)
         self.assertIn("my-server", config.connections)
@@ -49,9 +49,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_loads_servers_from_top_level(self) -> None:
         """从 JSON 顶层直接解析服务器配置（无需嵌套在 "servers" 键下）。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump(
                 {
                     "echo-server": {
@@ -69,9 +67,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_empty_config_returns_empty_connections(self) -> None:
         """空配置返回空的 connections 字典。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump({"servers": {}}, f)
             f.flush()
             config = load_mcp_config(f.name)
@@ -81,9 +77,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_disabled_server_is_excluded(self) -> None:
         """enabled: false 的服务器配置应被排除，不加载。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump(
                 {
                     "servers": {
@@ -104,15 +98,9 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_invalid_transport_raises(self) -> None:
         """无效的传输协议应抛出 ValueError。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump(
-                {
-                    "servers": {
-                        "bad": {"transport": "unknown", "command": "echo"}
-                    }
-                },
+                {"servers": {"bad": {"transport": "unknown", "command": "echo"}}},
                 f,
             )
             f.flush()
@@ -122,15 +110,9 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_invalid_server_name_raises(self) -> None:
         """非法服务器名称（包含非法字符）应抛出 ValueError。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump(
-                {
-                    "servers": {
-                        "bad name!": {"transport": "stdio", "command": "echo"}
-                    }
-                },
+                {"servers": {"bad name!": {"transport": "stdio", "command": "echo"}}},
                 f,
             )
             f.flush()
@@ -140,12 +122,8 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_missing_command_raises_for_stdio(self) -> None:
         """stdio 传输协议缺少 command 字段时应抛出 ValueError。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
-            json.dump(
-                {"servers": {"nocommand": {"transport": "stdio"}}}, f
-            )
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"servers": {"nocommand": {"transport": "stdio"}}}, f)
             f.flush()
             with self.assertRaises(ValueError):
                 load_mcp_config(f.name)
@@ -153,9 +131,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_missing_url_raises_for_sse(self) -> None:
         """SSE 传输协议缺少 url 字段时应抛出 ValueError。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump({"servers": {"nourl": {"transport": "sse"}}}, f)
             f.flush()
             with self.assertRaises(ValueError):
@@ -169,9 +145,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_invalid_json_raises(self) -> None:
         """非法 JSON 内容应抛出 ValueError。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             f.write("{invalid json")
             f.flush()
             with self.assertRaises(ValueError):
@@ -180,9 +154,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_tool_name_prefix_default(self) -> None:
         """验证默认启用工具名前缀（tool_name_prefix 为 True）。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump({"servers": {}}, f)
             f.flush()
             config = load_mcp_config(f.name)
@@ -192,9 +164,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
     def test_sse_transport(self) -> None:
         """验证 SSE 传输协议的配置正确加载，包括 transport 和 url 字段。"""
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump(
                 {
                     "servers": {
@@ -211,9 +181,7 @@ class LoadMCPConfigTests(unittest.TestCase):
 
         os.unlink(f.name)
         self.assertEqual(config.connections["sse-srv"]["transport"], "sse")
-        self.assertEqual(
-            config.connections["sse-srv"]["url"], "http://localhost:8080"
-        )
+        self.assertEqual(config.connections["sse-srv"]["url"], "http://localhost:8080")
 
 
 class ExpandEnvVarsTests(unittest.TestCase):
@@ -242,9 +210,7 @@ class ExpandEnvVarsTests(unittest.TestCase):
         """验证递归展开嵌套结构（字典、列表）中的环境变量。"""
         os.environ["_TEST_NESTED"] = "val"
         try:
-            result = _expand_env_vars(
-                {"key": "${_TEST_NESTED}", "list": ["${_TEST_NESTED}"]}
-            )
+            result = _expand_env_vars({"key": "${_TEST_NESTED}", "list": ["${_TEST_NESTED}"]})
             self.assertEqual(result, {"key": "val", "list": ["val"]})
         finally:
             del os.environ["_TEST_NESTED"]

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 # 导入评测核心函数：执行检索评测、写入评测报告
 from .eval_service import evaluate_retrieval_dataset, write_eval_report
+
 # 导入模型默认配置常量
 from .model_factory import (
     DEFAULT_EMBEDDING_MODEL,
@@ -13,6 +15,7 @@ from .model_factory import (
     DEFAULT_RERANKER_PROVIDER,
 )
 from .rag_service import RAGService
+
 # 导入追踪服务：用于记录评测过程中的事件日志
 from .trace_service import DEFAULT_TRACE_DIR, TraceRecorder, load_trace, summarize_trace
 
@@ -196,19 +199,15 @@ def main() -> None:
 
     # 根据 min-hit-rate 和 min-mrr 阈值检测评测是否达标，未达标则抛出 SystemExit
     failures = []
-    if (
-        args.min_hit_rate is not None
-        and report["summary"]["hit_rate"] < args.min_hit_rate
-    ):
-        failures.append(
-            f"hit_rate {report['summary']['hit_rate']:.4f} < {args.min_hit_rate:.4f}"
-        )
+    if args.min_hit_rate is not None and report["summary"]["hit_rate"] < args.min_hit_rate:
+        failures.append(f"hit_rate {report['summary']['hit_rate']:.4f} < {args.min_hit_rate:.4f}")
     if args.min_mrr is not None and report["summary"]["mrr"] < args.min_mrr:
         failures.append(f"mrr {report['summary']['mrr']:.4f} < {args.min_mrr:.4f}")
 
     # 如果有任何指标未达标，以非零退出码终止程序
     if failures:
-        raise SystemExit("Eval failed: " + "; ".join(failures))
+        print("Eval failed: " + "; ".join(failures), file=sys.stderr)
+        sys.exit(1)
 
 
 # 模块入口：直接运行此文件时调用 main()

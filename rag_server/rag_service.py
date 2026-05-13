@@ -16,6 +16,7 @@ RAG 核心检索引擎模块。
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -32,7 +33,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter  # 递归字
 from pypdf import PdfReader  # PDF 文档解析
 from rank_bm25 import BM25Plus  # BM25+ 关键词检索算法，相比 BM25Okapi 在小语料下更稳定
 
-from .cache_service import CacheTTLs, JsonCache, stable_cache_digest
+from .cache_service import CacheTTLs, JsonCache, read_cached_list, stable_cache_digest, write_cached_list
 from .model_factory import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_PROVIDER,
@@ -43,7 +44,7 @@ from .model_factory import (
     model_config_fingerprint,  # 根据模型配置生成指纹 Hash，用于缓存键和变更检测
 )
 from .trace_service import TraceRecorder, summarize_result
-from .utils import cache_key_or_none, utc_now
+from .utils import cache_key_or_none, normalize_vector_score, utc_now
 
 # jieba 分词库初始化时会触发 pkg_resources 弃用警告，这里忽略该噪音日志
 with warnings.catch_warnings():
@@ -94,10 +95,33 @@ MAX_SUMMARY_EMBEDDING_CHARS = 240
 MAX_KEYWORD_TERMS = 16
 
 # 中文关键词停用词表：这些高频虚词对检索无区分度，提取关键词时过滤掉。
+# 模块级线程池，复用于 sync→async 委托，避免重复创建/销毁线程
+_sync_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
 KEYWORD_STOPWORDS = {
-    "的", "了", "和", "与", "或", "是", "在", "对", "及", "以及",
-    "等", "为", "有", "可以", "需要", "如果", "一个", "这个", "那个",
-    "进行", "使用", "用户", "商品",
+    "的",
+    "了",
+    "和",
+    "与",
+    "或",
+    "是",
+    "在",
+    "对",
+    "及",
+    "以及",
+    "等",
+    "为",
+    "有",
+    "可以",
+    "需要",
+    "如果",
+    "一个",
+    "这个",
+    "那个",
+    "进行",
+    "使用",
+    "用户",
+    "商品",
 }
 
 
@@ -191,9 +215,7 @@ class RAGService:
         self.parent_chunk_size = parent_chunk_size or max(chunk_size * 3, chunk_size)
         # 父块重叠默认为子块重叠的 2 倍，但不能超过父块大小
         self.parent_chunk_overlap = (
-            min(chunk_overlap * 2, self.parent_chunk_size - 1)
-            if parent_chunk_overlap is None
-            else parent_chunk_overlap
+            min(chunk_overlap * 2, self.parent_chunk_size - 1) if parent_chunk_overlap is None else parent_chunk_overlap
         )
         # 校验分块参数合法性（重叠必须小于大小，子块不能大于父块等）
         self._validate_chunking_config(
@@ -239,9 +261,7 @@ class RAGService:
         # ── 追踪与缓存 ──
         self.trace_recorder = trace_recorder
         # 多向量融合权重：归一化处理用户传入的权重
-        self.multi_vector_weights = self._normalize_multi_vector_weights(
-            multi_vector_weights
-        )
+        self.multi_vector_weights = self._normalize_multi_vector_weights(multi_vector_weights)
         self.cache = cache
         self.cache_ttls = CacheTTLs.from_mapping(cache_ttls)
         # 缓存版本标识，在知识库内容变更时自动失效
@@ -263,9 +283,7 @@ class RAGService:
         # 构建多向量行列表：每个 record 拆成 3 个向量行（summary/keyword/semantic）
         self.vector_rows = self._build_vector_rows()
         # 加载或创建 FAISS 向量索引：若嵌入配置变更则强制重建
-        self.index = self._load_or_create_index(
-            force_rebuild=embedding_metadata_changed
-        )
+        self.index = self._load_or_create_index(force_rebuild=embedding_metadata_changed)
         # 重建 BM25 索引（基于当前 chunk 内容的 jieba 分词）
         self._rebuild_bm25()
 
@@ -318,14 +336,10 @@ class RAGService:
         """
         # 使用传入参数或默认配置的分块参数
         actual_chunk_size = chunk_size or self.chunk_size
-        actual_chunk_overlap = (
-            self.chunk_overlap if chunk_overlap is None else chunk_overlap
-        )
+        actual_chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
         actual_parent_chunk_size = parent_chunk_size or self.parent_chunk_size
         actual_parent_chunk_overlap = (
-            self.parent_chunk_overlap
-            if parent_chunk_overlap is None
-            else parent_chunk_overlap
+            self.parent_chunk_overlap if parent_chunk_overlap is None else parent_chunk_overlap
         )
         # 校验分块配置合法性
         self._validate_chunking_config(
@@ -337,12 +351,12 @@ class RAGService:
 
         # ── 分类统计变量 ──
         records_to_add: list[dict] = []
-        added_sources: list[str] = []       # 新增文档路径
-        updated_sources: list[str] = []     # 更新文档路径
-        skipped_sources: list[str] = []     # 跳过的文档路径（内容未变）
-        deleted_chunks = 0                  # 删除的旧 chunk 数量
-        added_parent_chunks = 0             # 新增的父块数量
-        changed_documents = False           # 是否有任何文档发生了变更
+        added_sources: list[str] = []  # 新增文档路径
+        updated_sources: list[str] = []  # 更新文档路径
+        skipped_sources: list[str] = []  # 跳过的文档路径（内容未变）
+        deleted_chunks = 0  # 删除的旧 chunk 数量
+        added_parent_chunks = 0  # 新增的父块数量
+        changed_documents = False  # 是否有任何文档发生了变更
 
         # ── 遍历每个文件，按需索引 ──
         for file_path in file_paths:
@@ -508,10 +522,7 @@ class RAGService:
             return result
 
         # 计算期望保留的文档 ID 集合
-        desired_doc_ids = {
-            self._document_id_for_path(Path(file_path))
-            for file_path in file_paths
-        }
+        desired_doc_ids = {self._document_id_for_path(Path(file_path)) for file_path in file_paths}
         # 找出不在文件列表中的多余文档并删除
         removed_sources: list[str] = []
         removed_chunks = 0
@@ -549,38 +560,22 @@ class RAGService:
             return
         self.trace_recorder.event("rag", name, payload)
 
-    def _read_cached_list(
+    def _trace_search_event(
         self,
-        category: str,
-        payload: dict[str, Any],
-    ) -> list[dict] | None:
-        """从缓存中读取列表类型的结果。
-
-        Returns:
-            缓存的字典列表，如果缓存未命中或数据格式不对则返回 None
-        """
-        key = cache_key_or_none(self.cache, category, payload)
-        if key is None:
-            return None
-        cached = self.cache.get_json(key)
-        # 确保缓存数据是列表格式
-        if not isinstance(cached, list):
-            return None
-        # 过滤掉非字典元素，确保类型安全
-        return [dict(item) for item in cached if isinstance(item, dict)]
-
-    def _write_cached_list(
-        self,
-        category: str,
-        payload: dict[str, Any],
-        value: list[dict],
-        ttl_s: int,
+        method: str,
+        start: float,
+        result_count: int,
+        results: list[dict[str, Any]] | None = None,
+        **extra: Any,
     ) -> None:
-        """将列表结果写入缓存，设置指定的过期时间（秒）。"""
-        key = cache_key_or_none(self.cache, category, payload)
-        if key is None:
+        """Emit a trace event for a search operation (skips work when tracing disabled)."""
+        if self.trace_recorder is None:
             return
-        self.cache.set_json(key, value, ttl_s=ttl_s)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        payload: dict[str, Any] = {"elapsed_ms": elapsed_ms, "result_count": result_count, **extra}
+        if results is not None:
+            payload["results"] = [summarize_result(item, include_content=True) for item in results]
+        self._trace_event(f"rag.{method}", payload)
 
     def _knowledge_cache_version(self) -> str:
         """生成知识库缓存版本标识。
@@ -607,9 +602,7 @@ class RAGService:
                             "doc_id": record.get("doc_id"),
                             "content_hash": record.get("content_hash"),
                             "parent_id": record.get("parent_id"),
-                            "parent_content_hash": record.get(
-                                "parent_content_hash"
-                            ),
+                            "parent_content_hash": record.get("parent_content_hash"),
                         }
                         for record in self.records
                     ],
@@ -682,7 +675,7 @@ class RAGService:
                     idx=idx,
                     score=vector_score,
                     vector_score=vector_score,
-                    bm25_score=0.0,       # 纯向量模式，BM25 分数为 0
+                    bm25_score=0.0,  # 纯向量模式，BM25 分数为 0
                     hybrid_score=vector_score,  # 纯向量模式，混合分数等于向量分数
                     rerank_score=None,
                     retrieval_mode="multi_vector",
@@ -706,9 +699,7 @@ class RAGService:
                 "vector_row_count": len(self.vector_rows),
                 "result_count": len(results),
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
+                "results": [summarize_result(item, include_content=True) for item in results],
             },
         )
         return results
@@ -731,9 +722,7 @@ class RAGService:
         """
         start = time.perf_counter()
         # 确定是否启用 BM25（优先用传入参数，否则用默认配置）
-        actual_use_bm25 = (
-            self.default_use_bm25 if use_bm25 is None else use_bm25
-        )
+        actual_use_bm25 = self.default_use_bm25 if use_bm25 is None else use_bm25
         if not actual_use_bm25:
             self._trace_event(
                 "rag.search_by_bm25",
@@ -808,7 +797,7 @@ class RAGService:
                 self._build_result(
                     idx=int(idx),
                     score=bm25_score,
-                    vector_score=0.0,        # 纯 BM25 模式，向量分数为 0
+                    vector_score=0.0,  # 纯 BM25 模式，向量分数为 0
                     bm25_score=bm25_score,
                     hybrid_score=bm25_score,  # 纯 BM25 模式，混合分数等于 BM25 分数
                     rerank_score=None,
@@ -829,9 +818,69 @@ class RAGService:
                 "candidate_count": len(candidate_results),
                 "result_count": len(results),
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
+                "results": [summarize_result(item, include_content=True) for item in results],
+            },
+        )
+        return results
+
+    def _search_by_hybrid_fuse(
+        self,
+        query: str,
+        top_k: int,
+        actual_vector_weight: float,
+        actual_bm25_weight: float,
+        actual_use_bm25: bool,
+        vector_details: dict[int, Any],
+        bm25_scores: dict[int, float],
+        cache_payload: dict[str, Any],
+        start: float,
+    ) -> list[dict]:
+        """加权融合、排序、去重、缓存和追踪（sync/async 共用核心逻辑）。
+
+        融合公式：hybrid_score = vector_weight × vector_score + bm25_weight × bm25_score
+        """
+        vector_scores = {idx: float(details["score"]) for idx, details in vector_details.items()}
+        candidate_ids = set(vector_scores) | set(bm25_scores)
+
+        ranked_results = []
+        for idx in candidate_ids:
+            vs = vector_scores.get(idx, 0.0)
+            bs = bm25_scores.get(idx, 0.0)
+            details = vector_details.get(idx, {"scores": {}, "matched_vector_types": [], "best_vector_type": None})
+            hybrid_score = actual_vector_weight * vs + actual_bm25_weight * bs
+            ranked_results.append(
+                self._build_result(
+                    idx=idx,
+                    score=hybrid_score,
+                    vector_score=vs,
+                    bm25_score=bs,
+                    hybrid_score=hybrid_score,
+                    rerank_score=None,
+                    retrieval_mode="hybrid" if actual_use_bm25 else "multi_vector",
+                    multi_vector_scores=details["scores"],
+                    matched_vector_types=details["matched_vector_types"],
+                    best_vector_type=details["best_vector_type"],
+                )
+            )
+
+        ranked_results.sort(key=lambda item: item["score"], reverse=True)
+        results = self._deduplicate_parent_results(ranked_results)[:top_k]
+
+        write_cached_list(self.cache,"retrieval", cache_payload, results, ttl_s=self.cache_ttls.retrieval_ttl_s)
+        self._trace_event(
+            "rag.search_by_hybrid",
+            {
+                "query": query,
+                "top_k": top_k,
+                "vector_weight": actual_vector_weight,
+                "bm25_weight": actual_bm25_weight,
+                "use_bm25": actual_use_bm25,
+                "candidate_count": len(candidate_ids),
+                "vector_row_count": len(self.vector_rows),
+                "result_count": len(results),
+                "cache_hit": False,
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+                "results": [summarize_result(item, include_content=True) for item in results],
             },
         )
         return results
@@ -844,155 +893,13 @@ class RAGService:
         bm25_weight: float = 0.3,
         use_bm25: bool | None = None,
     ) -> list[dict]:
-        """混合检索：向量召回和 BM25 召回加权融合后的结果，不做精排。
-
-        融合公式：hybrid_score = vector_weight × vector_score + bm25_weight × bm25_score
-
-        流程：
-        1. 同时执行多向量检索和 BM25 检索，各自获取候选集
-        2. 对两个候选集的并集，按加权公式计算混合分数
-        3. 按混合分数降序排列，父块去重后返回 top_k 结果
-
-        这是 search() 的第一阶段，结果可进一步送入 rerank() 做精排。
-        """
-        start = time.perf_counter()
-        # 空查询或无数据时直接返回空列表
-        if not query.strip() or not self.records:
-            self._trace_event(
-                "rag.search_by_hybrid",
-                {
-                    "query": query,
-                    "top_k": top_k,
-                    "result_count": 0,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                },
-            )
-            return []
-
-        # 确定是否启用 BM25，并据此调整权重
-        actual_use_bm25 = (
-            self.default_use_bm25 if use_bm25 is None else use_bm25
-        )
-        # 若 BM25 关闭，向量权重为 1.0（纯向量模式）
-        actual_vector_weight = 1.0 if not actual_use_bm25 else vector_weight
-        # 若 BM25 关闭，BM25 权重为 0
-        actual_bm25_weight = bm25_weight if actual_use_bm25 else 0.0
-        # 校验权重合法性（不能同时为 0）
-        self._validate_weights(actual_vector_weight, actual_bm25_weight)
-
-        # ── 检查检索缓存 ──
-        cache_payload = self._retrieval_cache_payload(
-            "search_by_hybrid",
-            query=query,
-            top_k=top_k,
-            vector_weight=actual_vector_weight,
-            bm25_weight=actual_bm25_weight,
-            use_bm25=actual_use_bm25,
-        )
-        cached_results = self._read_cached_list("retrieval", cache_payload)
-        if cached_results is not None:
-            # 缓存命中，直接返回
-            self._trace_event(
-                "rag.search_by_hybrid",
-                {
-                    "query": query,
-                    "top_k": top_k,
-                    "vector_weight": actual_vector_weight,
-                    "bm25_weight": actual_bm25_weight,
-                    "use_bm25": actual_use_bm25,
-                    "candidate_count": None,
-                    "vector_row_count": len(self.vector_rows),
-                    "result_count": len(cached_results),
-                    "cache_hit": True,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                    "results": [
-                        summarize_result(item, include_content=True)
-                        for item in cached_results
-                    ],
-                },
-            )
-            return cached_results
-
-        # ── 执行向量召回和 BM25 召回 ──
-        limit = self._candidate_limit(top_k)
-        # 多向量检索：返回每个 chunk 的加权分数详情
-        vector_details = self._vector_score_details_map(query, limit)
-        # 提取向量分数映射 {chunk_index: score}
-        vector_scores = {
-            idx: float(details["score"]) for idx, details in vector_details.items()
-        }
-        # BM25 检索：返回每个 chunk 的 BM25 分数映射 {chunk_index: score}
-        bm25_scores = self._bm25_score_map(query, limit) if actual_use_bm25 else {}
-        # 合并两个召回源的候选索引集合（并集）
-        candidate_ids = set(vector_scores) | set(bm25_scores)
-
-        # ── 加权融合排序 ──
-        # 对每个候选 chunk，按加权公式计算最终混合分数：
-        # hybrid_score = vector_weight × vector_score + bm25_weight × bm25_score
-        ranked_results = []
-        for idx in candidate_ids:
-            vector_score = vector_scores.get(idx, 0.0)
-            bm25_score = bm25_scores.get(idx, 0.0)
-            # 获取向量详情（若该 chunk 只在 BM25 中有则给默认空详情）
-            details = vector_details.get(
-                idx,
-                {
-                    "scores": {},
-                    "matched_vector_types": [],
-                    "best_vector_type": None,
-                },
-            )
-            # 加权融合分数
-            hybrid_score = (
-                actual_vector_weight * vector_score
-                + actual_bm25_weight * bm25_score
-            )
-            ranked_results.append(
-                self._build_result(
-                    idx=idx,
-                    score=hybrid_score,
-                    vector_score=vector_score,
-                    bm25_score=bm25_score,
-                    hybrid_score=hybrid_score,
-                    rerank_score=None,
-                    retrieval_mode="hybrid" if actual_use_bm25 else "multi_vector",
-                    multi_vector_scores=details["scores"],
-                    matched_vector_types=details["matched_vector_types"],
-                    best_vector_type=details["best_vector_type"],
-                )
-            )
-
-        # 按混合分数降序排列，父块去重，截取 top_k
-        ranked_results.sort(key=lambda item: item["score"], reverse=True)
-        results = self._deduplicate_parent_results(ranked_results)[:top_k]
-
-        # 写入检索缓存，避免重复计算
-        self._write_cached_list(
-            "retrieval",
-            cache_payload,
-            results,
-            ttl_s=self.cache_ttls.retrieval_ttl_s,
-        )
-        # 记录追踪事件
-        self._trace_event(
-            "rag.search_by_hybrid",
-            {
-                "query": query,
-                "top_k": top_k,
-                "vector_weight": actual_vector_weight,
-                "bm25_weight": actual_bm25_weight,
-                "use_bm25": actual_use_bm25,
-                "candidate_count": len(candidate_ids),
-                "vector_row_count": len(self.vector_rows),
-                "result_count": len(results),
-                "cache_hit": False,
-                "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
-            },
-        )
-        return results
+        """混合检索：向量召回和 BM25 召回加权融合后的结果，不做精排。"""
+        coro = self.asearch_by_hybrid(query, top_k, vector_weight, bm25_weight, use_bm25)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        return _sync_pool.submit(asyncio.run, coro).result()
 
     async def asearch_by_hybrid(
         self,
@@ -1002,35 +909,20 @@ class RAGService:
         bm25_weight: float = 0.3,
         use_bm25: bool | None = None,
     ) -> list[dict]:
-        """异步混合检索。
-
-        与 search_by_hybrid 逻辑完全一致，唯一区别是向量检索和 BM25 检索
-        通过 asyncio.gather 并发执行，在 IO 密集型场景（如远程嵌入 API）下
-        可以减少总延迟。
-        """
+        """异步混合检索：向量检索和 BM25 检索通过 asyncio.gather 并发执行。"""
         start = time.perf_counter()
-        # 空查询或无数据时返回空
         if not query.strip() or not self.records:
             self._trace_event(
                 "rag.search_by_hybrid",
-                {
-                    "query": query,
-                    "top_k": top_k,
-                    "result_count": 0,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                },
+                {"query": query, "top_k": top_k, "result_count": 0, "elapsed_ms": (time.perf_counter() - start) * 1000},
             )
             return []
 
-        # 确定 BM25 是否启用并调整权重
-        actual_use_bm25 = (
-            self.default_use_bm25 if use_bm25 is None else use_bm25
-        )
+        actual_use_bm25 = self.default_use_bm25 if use_bm25 is None else use_bm25
         actual_vector_weight = 1.0 if not actual_use_bm25 else vector_weight
         actual_bm25_weight = bm25_weight if actual_use_bm25 else 0.0
         self._validate_weights(actual_vector_weight, actual_bm25_weight)
 
-        # ── 检查检索缓存 ──
         cache_payload = self._retrieval_cache_payload(
             "search_by_hybrid",
             query=query,
@@ -1039,7 +931,7 @@ class RAGService:
             bm25_weight=actual_bm25_weight,
             use_bm25=actual_use_bm25,
         )
-        cached_results = self._read_cached_list("retrieval", cache_payload)
+        cached_results = read_cached_list(self.cache,"retrieval", cache_payload)
         if cached_results is not None:
             self._trace_event(
                 "rag.search_by_hybrid",
@@ -1054,97 +946,31 @@ class RAGService:
                     "result_count": len(cached_results),
                     "cache_hit": True,
                     "elapsed_ms": (time.perf_counter() - start) * 1000,
-                    "results": [
-                        summarize_result(item, include_content=True)
-                        for item in cached_results
-                    ],
+                    "results": [summarize_result(item, include_content=True) for item in cached_results],
                 },
             )
             return cached_results
 
-        # ── 并发执行向量检索和 BM25 检索（关键优化点）──
         limit = self._candidate_limit(top_k)
-        # 向量检索任务：在独立线程中执行（避免阻塞异步事件循环）
         vector_task = asyncio.to_thread(self._vector_score_details_map, query, limit)
-        # BM25 检索任务：若启用则同样在线程中执行，否则用 sleep(0) 产生空结果
-        bm25_task = (
-            asyncio.to_thread(self._bm25_score_map, query, limit)
-            if actual_use_bm25
-            else asyncio.sleep(0, result={})
-        )
-        # 并发等待两个任务完成
-        vector_details, bm25_scores = await asyncio.gather(vector_task, bm25_task)
+        bm25_task = asyncio.to_thread(self._bm25_score_map, query, limit) if actual_use_bm25 else None
+        bm25_scores: dict[int, float] = {}
+        if bm25_task is not None:
+            vector_details, bm25_scores = await asyncio.gather(vector_task, bm25_task)
+        else:
+            vector_details = await vector_task
 
-        # 提取向量分数映射
-        vector_scores = {
-            idx: float(details["score"]) for idx, details in vector_details.items()
-        }
-        # 合并两个召回源的候选索引集合（并集）
-        candidate_ids = set(vector_scores) | set(bm25_scores)
-
-        # ── 加权融合排序 ──
-        ranked_results = []
-        for idx in candidate_ids:
-            vector_score = vector_scores.get(idx, 0.0)
-            bm25_score = bm25_scores.get(idx, 0.0)
-            details = vector_details.get(
-                idx,
-                {
-                    "scores": {},
-                    "matched_vector_types": [],
-                    "best_vector_type": None,
-                },
-            )
-            # 加权融合：hybrid_score = vector_weight × vector_score + bm25_weight × bm25_score
-            hybrid_score = (
-                actual_vector_weight * vector_score
-                + actual_bm25_weight * bm25_score
-            )
-            ranked_results.append(
-                self._build_result(
-                    idx=idx,
-                    score=hybrid_score,
-                    vector_score=vector_score,
-                    bm25_score=bm25_score,
-                    hybrid_score=hybrid_score,
-                    rerank_score=None,
-                    retrieval_mode="hybrid" if actual_use_bm25 else "multi_vector",
-                    multi_vector_scores=details["scores"],
-                    matched_vector_types=details["matched_vector_types"],
-                    best_vector_type=details["best_vector_type"],
-                )
-            )
-
-        # 按混合分数降序排列，父块去重，截取 top_k
-        ranked_results.sort(key=lambda item: item["score"], reverse=True)
-        results = self._deduplicate_parent_results(ranked_results)[:top_k]
-
-        # 写入缓存，记录追踪
-        self._write_cached_list(
-            "retrieval",
+        return self._search_by_hybrid_fuse(
+            query,
+            top_k,
+            actual_vector_weight,
+            actual_bm25_weight,
+            actual_use_bm25,
+            vector_details,
+            bm25_scores,
             cache_payload,
-            results,
-            ttl_s=self.cache_ttls.retrieval_ttl_s,
+            start,
         )
-        self._trace_event(
-            "rag.search_by_hybrid",
-            {
-                "query": query,
-                "top_k": top_k,
-                "vector_weight": actual_vector_weight,
-                "bm25_weight": actual_bm25_weight,
-                "use_bm25": actual_use_bm25,
-                "candidate_count": len(candidate_ids),
-                "vector_row_count": len(self.vector_rows),
-                "result_count": len(results),
-                "cache_hit": False,
-                "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
-            },
-        )
-        return results
 
     def rerank(
         self,
@@ -1191,7 +1017,7 @@ class RAGService:
             reranker_model_kwargs=self.reranker_model_kwargs,
             reranker_device=self.reranker_device,
         )
-        cached_results = self._read_cached_list("rerank", cache_payload)
+        cached_results = read_cached_list(self.cache,"rerank", cache_payload)
         if cached_results is not None:
             self._trace_event(
                 "rag.rerank",
@@ -1204,10 +1030,7 @@ class RAGService:
                     "result_count": len(cached_results),
                     "cache_hit": True,
                     "elapsed_ms": (time.perf_counter() - start) * 1000,
-                    "results": [
-                        summarize_result(item, include_content=True)
-                        for item in cached_results
-                    ],
+                    "results": [summarize_result(item, include_content=True) for item in cached_results],
                 },
             )
             return cached_results
@@ -1228,7 +1051,7 @@ class RAGService:
 
         # ── 合并重排序分数到结果中 ──
         reranked = []
-        for item, rerank_score in zip(candidates, rerank_scores, strict=False):
+        for item, rerank_score in zip(candidates, rerank_scores, strict=True):
             merged = dict(item)
             # 用重排序分数替换原分数（原混合分数仍保留在 hybrid_score 字段）
             merged["score"] = float(rerank_score)
@@ -1241,7 +1064,7 @@ class RAGService:
         results = reranked if top_k is None else reranked[:top_k]
 
         # 写入重排序缓存
-        self._write_cached_list(
+        write_cached_list(self.cache,
             "rerank",
             cache_payload,
             results,
@@ -1259,13 +1082,8 @@ class RAGService:
                 "result_count": len(results),
                 "cache_hit": False,
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "candidates": [
-                    summarize_result(item, include_content=True)
-                    for item in candidates
-                ],
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
+                "candidates": [summarize_result(item, include_content=True) for item in candidates],
+                "results": [summarize_result(item, include_content=True) for item in results],
             },
         )
         return results
@@ -1297,118 +1115,16 @@ class RAGService:
         use_rerank: bool | None = None,
         candidate_top_k: int | None = None,
     ) -> list[dict]:
-        """默认搜索入口 —— 完整的 RAG 检索管线。
-
-        流程：
-        1. 检查检索缓存（包含所有参数的完整缓存键）
-        2. 执行混合召回（向量 + BM25 融合），获取 candidate_top_k 个候选
-        3. 若启用重排序，对候选调用 CrossEncoder 精排
-        4. 返回最终 top_k 结果
-
-        这是外部调用者的首选方法，一站式完成检索+排序。
-        """
-        start = time.perf_counter()
-        # 空查询或无数据时返回空
-        if not query.strip() or not self.records:
-            self._trace_event(
-                "rag.search",
-                {
-                    "query": query,
-                    "top_k": top_k,
-                    "result_count": 0,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                },
-            )
-            return []
-
-        # 确定重排序和候选数量配置
-        actual_use_rerank = (
-            self.default_use_rerank if use_rerank is None else use_rerank
+        """默认搜索入口 —— 完整的 RAG 检索管线（委托异步版本执行）。"""
+        coro = self.asearch(
+            query, top_k, vector_weight, bm25_weight,
+            use_bm25, use_rerank, candidate_top_k,
         )
-        actual_candidate_top_k = candidate_top_k or self.default_candidate_top_k
-        # 候选数量不能小于最终需要的 top_k
-        actual_candidate_top_k = max(actual_candidate_top_k, top_k)
-        actual_use_bm25 = self.default_use_bm25 if use_bm25 is None else use_bm25
-
-        # ── 检查完整检索缓存 ──
-        cache_payload = self._retrieval_cache_payload(
-            "search",
-            query=query,
-            top_k=top_k,
-            candidate_top_k=actual_candidate_top_k,
-            vector_weight=vector_weight,
-            bm25_weight=bm25_weight,
-            use_bm25=actual_use_bm25,
-            use_rerank=actual_use_rerank,
-        )
-        cached_results = self._read_cached_list("retrieval", cache_payload)
-        if cached_results is not None:
-            self._trace_event(
-                "rag.search",
-                {
-                    "query": query,
-                    "top_k": top_k,
-                    "candidate_top_k": actual_candidate_top_k,
-                    "use_bm25": actual_use_bm25,
-                    "use_rerank": actual_use_rerank,
-                    "candidate_count": None,
-                    "result_count": len(cached_results),
-                    "cache_hit": True,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                    "results": [
-                        summarize_result(item, include_content=True)
-                        for item in cached_results
-                    ],
-                },
-            )
-            return cached_results
-
-        # ── 第一阶段：混合召回 ──
-        hybrid_candidates = self.search_by_hybrid(
-            query=query,
-            top_k=actual_candidate_top_k,  # 召回更多候选供重排序使用
-            vector_weight=vector_weight,
-            bm25_weight=bm25_weight,
-            use_bm25=use_bm25,
-        )
-
-        # ── 第二阶段：可选重排序 ──
-        if not actual_use_rerank:
-            # 不启用重排序时，直接从混合结果截取 top_k
-            results = hybrid_candidates[:top_k]
-        else:
-            # 启用重排序时，对混合候选集进行 CrossEncoder 精排
-            results = self.rerank(
-                query=query,
-                candidates=hybrid_candidates,
-                top_k=top_k,
-            )
-
-        # 写入缓存并记录追踪
-        self._write_cached_list(
-            "retrieval",
-            cache_payload,
-            results,
-            ttl_s=self.cache_ttls.retrieval_ttl_s,
-        )
-        self._trace_event(
-            "rag.search",
-            {
-                "query": query,
-                "top_k": top_k,
-                "candidate_top_k": actual_candidate_top_k,
-                "use_bm25": actual_use_bm25,
-                "use_rerank": actual_use_rerank,
-                "candidate_count": len(hybrid_candidates),
-                "result_count": len(results),
-                "cache_hit": False,
-                "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
-            },
-        )
-        return results
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        return _sync_pool.submit(asyncio.run, coro).result()
 
     async def asearch(
         self,
@@ -1440,9 +1156,7 @@ class RAGService:
             return []
 
         # 确定重排序和候选数量配置
-        actual_use_rerank = (
-            self.default_use_rerank if use_rerank is None else use_rerank
-        )
+        actual_use_rerank = self.default_use_rerank if use_rerank is None else use_rerank
         actual_candidate_top_k = candidate_top_k or self.default_candidate_top_k
         actual_candidate_top_k = max(actual_candidate_top_k, top_k)
         actual_use_bm25 = self.default_use_bm25 if use_bm25 is None else use_bm25
@@ -1458,7 +1172,7 @@ class RAGService:
             use_bm25=actual_use_bm25,
             use_rerank=actual_use_rerank,
         )
-        cached_results = self._read_cached_list("retrieval", cache_payload)
+        cached_results = read_cached_list(self.cache,"retrieval", cache_payload)
         if cached_results is not None:
             self._trace_event(
                 "rag.search",
@@ -1472,10 +1186,7 @@ class RAGService:
                     "result_count": len(cached_results),
                     "cache_hit": True,
                     "elapsed_ms": (time.perf_counter() - start) * 1000,
-                    "results": [
-                        summarize_result(item, include_content=True)
-                        for item in cached_results
-                    ],
+                    "results": [summarize_result(item, include_content=True) for item in cached_results],
                 },
             )
             return cached_results
@@ -1500,7 +1211,7 @@ class RAGService:
             )
 
         # 写入缓存并记录追踪
-        self._write_cached_list(
+        write_cached_list(self.cache,
             "retrieval",
             cache_payload,
             results,
@@ -1518,9 +1229,7 @@ class RAGService:
                 "result_count": len(results),
                 "cache_hit": False,
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
+                "results": [summarize_result(item, include_content=True) for item in results],
             },
         )
         return results
@@ -1595,10 +1304,10 @@ class RAGService:
                         source_hash=source_hash,
                         child_content=child_content,
                         child_chunk_index=len(records),  # 全局递增的子块索引
-                        child_index=child_index,          # 父块内的子块序号
+                        child_index=child_index,  # 父块内的子块序号
                         parent_id=parent_id,
                         parent_index=parent_index,
-                        parent_content=parent_content,    # 保留完整父块内容
+                        parent_content=parent_content,  # 保留完整父块内容
                         parent_content_hash=parent_content_hash,
                     )
                 )
@@ -1608,7 +1317,7 @@ class RAGService:
             "doc_id": doc_id,
             "source": source,
             "source_hash": source_hash,
-            "chunk_count": len(records),           # 子块总数
+            "chunk_count": len(records),  # 子块总数
             "parent_chunk_count": len(parent_chunks),  # 父块总数
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
@@ -1650,9 +1359,7 @@ class RAGService:
         """
         content_hash = self._hash_text(child_content)
         # 子块 ID：doc_id:parent:父索引:child:子索引:内容哈希前12位
-        child_chunk_id = (
-            f"{doc_id}:parent:{parent_index}:child:{child_index}:{content_hash[:12]}"
-        )
+        child_chunk_id = f"{doc_id}:parent:{parent_index}:child:{child_index}:{content_hash[:12]}"
         return {
             "id": child_chunk_id,
             "doc_id": doc_id,
@@ -1667,8 +1374,8 @@ class RAGService:
             "parent_content": parent_content,  # 父块完整内容（检索返回用）
             "metadata": {
                 "doc_id": doc_id,
-                "chunk_id": parent_id,          # 兼容旧字段，指向父块
-                "chunk_index": parent_index,    # 兼容旧字段，父块索引
+                "chunk_id": parent_id,  # 兼容旧字段，指向父块
+                "chunk_index": parent_index,  # 兼容旧字段，父块索引
                 "parent_id": parent_id,
                 "parent_index": parent_index,
                 "parent_content_hash": parent_content_hash,
@@ -1711,14 +1418,12 @@ class RAGService:
             and int(existing_info.get("chunk_size") or 0) == chunk_size
             and int(existing_info.get("chunk_overlap") or 0) == chunk_overlap
             and int(existing_info.get("parent_chunk_size") or 0) == parent_chunk_size
-            and int(existing_info.get("parent_chunk_overlap") or 0)
-            == parent_chunk_overlap
+            and int(existing_info.get("parent_chunk_overlap") or 0) == parent_chunk_overlap
             and existing_info.get("chunking_strategy") == CHUNKING_STRATEGY
             and existing_info.get("embedding_strategy") == MULTI_VECTOR_STRATEGY
             and existing_info.get("embedding_provider") == self.embedding_provider
             and existing_info.get("embedding_model") == self.embedding_model_name
-            and existing_info.get("embedding_config_hash")
-            == self.embedding_config_hash
+            and existing_info.get("embedding_config_hash") == self.embedding_config_hash
         )
 
     def _remove_document_records(self, doc_id: str) -> int:
@@ -1732,8 +1437,7 @@ class RAGService:
             record
             for record in self.records
             # 兼容两种 doc_id 存储位置：顶层或 metadata 内
-            if str(record.get("doc_id") or record.get("metadata", {}).get("doc_id"))
-            != doc_id
+            if str(record.get("doc_id") or record.get("metadata", {}).get("doc_id")) != doc_id
         ]
         return before - len(self.records)
 
@@ -1872,10 +1576,7 @@ class RAGService:
             if document_info.get("embedding_model") != self.embedding_model_name:
                 document_info["embedding_model"] = self.embedding_model_name
                 changed = True
-            if (
-                document_info.get("embedding_config_hash")
-                != self.embedding_config_hash
-            ):
+            if document_info.get("embedding_config_hash") != self.embedding_config_hash:
                 document_info["embedding_config_hash"] = self.embedding_config_hash
                 changed = True
 
@@ -1917,7 +1618,7 @@ class RAGService:
                 rows.append(
                     {
                         "record_index": record_index,  # 指向原始 chunk 的索引
-                        "vector_type": vector_type,    # summary/keyword/semantic
+                        "vector_type": vector_type,  # summary/keyword/semantic
                         "text": embedding_texts[vector_type],
                     }
                 )
@@ -1933,11 +1634,7 @@ class RAGService:
             return ""
 
         # 按句尾标点分割句子
-        sentences = [
-            item.strip()
-            for item in re.split(r"(?<=[。！？；.!?;])\s*|\n+", text)
-            if item.strip()
-        ]
+        sentences = [item.strip() for item in re.split(r"(?<=[。！？；.!?;])\s*|\n+", text) if item.strip()]
         # 取前两句拼接
         summary = " ".join(sentences[:2]) if sentences else text
         if len(summary) <= MAX_SUMMARY_EMBEDDING_CHARS:
@@ -2181,11 +1878,7 @@ class RAGService:
         小语料场景下，BM25Plus 比 BM25Okapi 更容易得到稳定的关键词分数。
         """
         # 构建分词语料：每个 chunk 内容用 jieba 分词
-        tokenized_corpus = [
-            self._tokenize(record["content"])
-            for record in self.records
-            if record["content"].strip()
-        ]
+        tokenized_corpus = [self._tokenize(record["content"]) for record in self.records if record["content"].strip()]
         # 有语料则创建 BM25Plus 实例，否则设为 None
         self.bm25 = BM25Plus(tokenized_corpus) if tokenized_corpus else None
 
@@ -2198,11 +1891,7 @@ class RAGService:
 
         所有 token 转为小写并去除首尾空白。
         """
-        return [
-            token.lower().strip()
-            for token in jieba.lcut_for_search(text)
-            if token.strip()
-        ]
+        return [token.lower().strip() for token in jieba.lcut_for_search(text) if token.strip()]
 
     def _vector_score_details_map(self, query: str, limit: int) -> dict[int, dict]:
         """多向量检索：返回每个 chunk 的详细分数信息。
@@ -2231,7 +1920,7 @@ class RAGService:
 
         # 按 chunk (record_index) 分组收集命中信息
         hits: dict[int, dict] = {}
-        for raw_score, row_idx in zip(scores[0], indices[0], strict=False):
+        for raw_score, row_idx in zip(scores[0], indices[0], strict=True):
             # 跳过无效索引（FAISS 没找到足够结果时返回 -1）
             if row_idx < 0 or row_idx >= len(self.vector_rows):
                 continue
@@ -2240,14 +1929,14 @@ class RAGService:
             record_idx = int(vector_row["record_index"])  # 所属 chunk 的索引
             vector_type = str(vector_row["vector_type"])  # 向量类型
             # 内积分数归一化到 [0, 1]
-            vector_score = self._normalize_vector_score(float(raw_score))
+            vector_score = normalize_vector_score(float(raw_score))
 
             # 初始化该 chunk 的命中记录
             hit = hits.setdefault(
                 record_idx,
                 {
-                    "scores": {},       # {vector_type: best_score}
-                    "row_indices": {},   # {vector_type: row_idx}
+                    "scores": {},  # {vector_type: best_score}
+                    "row_indices": {},  # {vector_type: row_idx}
                 },
             )
 
@@ -2277,9 +1966,7 @@ class RAGService:
                     if vector_type in vector_scores
                 },
                 "matched_vector_types": matched_vector_types,
-                "best_vector_type": (
-                    matched_vector_types[0] if matched_vector_types else None
-                ),
+                "best_vector_type": (matched_vector_types[0] if matched_vector_types else None),
                 "row_indices": hit["row_indices"],
             }
         return result
@@ -2350,14 +2037,6 @@ class RAGService:
             if raw_scores[idx] > 0  # 过滤掉分数为 0 的
         }
 
-    def _normalize_vector_score(self, score: float) -> float:
-        """将 FAISS 内积分数归一化到 [0, 1]。
-
-        L2 归一化向量的内积范围是 [-1, 1]，通过 (score+1)/2 映射到 [0, 1]，
-        方便与 BM25 分数融合时使用统一的分数尺度。
-        """
-        return max(0.0, min(1.0, (score + 1) / 2))
-
     def _normalize_bm25_scores(self, scores: np.ndarray) -> np.ndarray:
         """将 BM25 原始分数归一化到 [0, 1]：除以最大分数。
 
@@ -2416,12 +2095,7 @@ class RAGService:
         """
         metadata = item.get("metadata") or {}
         doc_id = str(item.get("doc_id") or metadata.get("doc_id") or "")
-        parent_id = str(
-            metadata.get("parent_id")
-            or metadata.get("chunk_id")
-            or metadata.get("chunk_index")
-            or ""
-        )
+        parent_id = str(metadata.get("parent_id") or metadata.get("chunk_id") or metadata.get("chunk_index") or "")
         return doc_id, parent_id
 
     def _validate_weights(self, vector_weight: float, bm25_weight: float) -> None:
@@ -2458,9 +2132,7 @@ class RAGService:
         # 检查是否有未知的向量类型
         unknown = sorted(set(weights) - set(MULTI_VECTOR_TYPES))
         if unknown:
-            raise ValueError(
-                "Unknown multi-vector weight(s): " + ", ".join(unknown)
-            )
+            raise ValueError("Unknown multi-vector weight(s): " + ", ".join(unknown))
 
         # 逐个覆盖默认权重
         for vector_type, raw_weight in weights.items():
@@ -2497,13 +2169,9 @@ class RAGService:
         if child_chunk_overlap >= child_chunk_size:
             raise ValueError("chunk_overlap must be smaller than chunk_size")
         if parent_chunk_overlap >= parent_chunk_size:
-            raise ValueError(
-                "parent_chunk_overlap must be smaller than parent_chunk_size"
-            )
+            raise ValueError("parent_chunk_overlap must be smaller than parent_chunk_size")
         if child_chunk_size > parent_chunk_size:
-            raise ValueError(
-                "chunk_size must be smaller than or equal to parent_chunk_size"
-            )
+            raise ValueError("chunk_size must be smaller than or equal to parent_chunk_size")
 
     def _get_reranker(self) -> Any:
         """获取重排序模型实例（懒加载）。
@@ -2558,27 +2226,27 @@ class RAGService:
         元数据中包含完整的来源、层级和嵌入配置信息。
         """
         record = self.records[idx]
-        child_content = record["content"]         # 子块内容（精确匹配用）
+        child_content = record["content"]  # 子块内容（精确匹配用）
         parent_content = record.get("parent_content") or child_content  # 父块内容（展示用）
         return {
             # 核心分数
-            "score": float(score),                  # 当前模式的最终分数
-            "vector_score": float(vector_score),    # 向量检索分数
-            "bm25_score": float(bm25_score),        # BM25 检索分数
-            "hybrid_score": float(hybrid_score),    # 混合融合分数
+            "score": float(score),  # 当前模式的最终分数
+            "vector_score": float(vector_score),  # 向量检索分数
+            "bm25_score": float(bm25_score),  # BM25 检索分数
+            "hybrid_score": float(hybrid_score),  # 混合融合分数
             "rerank_score": None if rerank_score is None else float(rerank_score),
             # 多向量详情
             "multi_vector_scores": multi_vector_scores or {},
             "matched_vector_types": matched_vector_types or [],
             "best_vector_type": best_vector_type,
             # 内容：父块为主，子块为辅助
-            "content": parent_content,           # 返回父块完整内容（展示用）
-            "child_content": child_content,       # 子块内容（调试用）
+            "content": parent_content,  # 返回父块完整内容（展示用）
+            "child_content": child_content,  # 子块内容（调试用）
             # 来源信息
             "source": record["source"],
             "doc_id": record.get("doc_id"),
             "metadata": record["metadata"],
-            "retrieval_mode": retrieval_mode,    # 检索模式标识
+            "retrieval_mode": retrieval_mode,  # 检索模式标识
         }
 
     def _load_records(self) -> list[dict]:
@@ -2639,21 +2307,11 @@ class RAGService:
 
             # ── 解析或生成标识字段 ──
             # 文档 ID（支持多处来源的优先级链）
-            doc_id = str(
-                raw_record.get("doc_id")
-                or metadata.get("doc_id")
-                or self._document_id_for_source(source)
-            )
+            doc_id = str(raw_record.get("doc_id") or metadata.get("doc_id") or self._document_id_for_source(source))
             # 源文件哈希
-            source_hash = str(
-                raw_record.get("source_hash")
-                or metadata.get("source_hash")
-                or ""
-            )
+            source_hash = str(raw_record.get("source_hash") or metadata.get("source_hash") or "")
             # 子块内容哈希
-            content_hash = str(
-                raw_record.get("content_hash") or self._hash_text(content)
-            )
+            content_hash = str(raw_record.get("content_hash") or self._hash_text(content))
             # 父块内容
             parent_content = str(raw_record.get("parent_content") or content)
             # 父块内容哈希
@@ -2674,8 +2332,7 @@ class RAGService:
                 raw_record.get("id")
                 or metadata.get("child_chunk_id")
                 or (
-                    f"{doc_id}:parent:{parent_index}:child:"
-                    f"{child_index}:{content_hash[:12]}"
+                    f"{doc_id}:parent:{parent_index}:child:{child_index}:{content_hash[:12]}"
                     if metadata.get("parent_id")
                     else metadata.get("chunk_id")
                 )
@@ -2684,9 +2341,9 @@ class RAGService:
 
             # ── 合并规范化 metadata ──
             merged_metadata = {
-                **metadata,           # 保留原有字段
+                **metadata,  # 保留原有字段
                 "doc_id": doc_id,
-                "chunk_id": parent_id,     # 兼容旧字段
+                "chunk_id": parent_id,  # 兼容旧字段
                 "chunk_index": parent_index,  # 兼容旧字段
                 "parent_id": parent_id,
                 "parent_index": parent_index,
@@ -2699,19 +2356,11 @@ class RAGService:
                 merged_metadata["source_hash"] = source_hash
             if "chunking_strategy" in metadata:
                 merged_metadata["chunking_strategy"] = metadata["chunking_strategy"]
-            merged_metadata["embedding_strategy"] = str(
-                metadata.get("embedding_strategy") or MULTI_VECTOR_STRATEGY
-            )
+            merged_metadata["embedding_strategy"] = str(metadata.get("embedding_strategy") or MULTI_VECTOR_STRATEGY)
             merged_metadata["embedding_types"] = list(MULTI_VECTOR_TYPES)
-            merged_metadata["embedding_provider"] = str(
-                metadata.get("embedding_provider") or ""
-            )
-            merged_metadata["embedding_model"] = str(
-                metadata.get("embedding_model") or ""
-            )
-            merged_metadata["embedding_config_hash"] = str(
-                metadata.get("embedding_config_hash") or ""
-            )
+            merged_metadata["embedding_provider"] = str(metadata.get("embedding_provider") or "")
+            merged_metadata["embedding_model"] = str(metadata.get("embedding_model") or "")
+            merged_metadata["embedding_config_hash"] = str(metadata.get("embedding_config_hash") or "")
 
             # ── 规范化嵌入文本 ──
             embedding_texts = self._normalize_embedding_texts(
@@ -2755,9 +2404,7 @@ class RAGService:
             return {}
 
         # 兼容包装格式和原始格式
-        raw_documents = (
-            payload.get("documents") if isinstance(payload, dict) else payload
-        )
+        raw_documents = payload.get("documents") if isinstance(payload, dict) else payload
         documents: dict[str, dict] = {}
         if isinstance(raw_documents, dict):
             # 字典格式（推荐）
@@ -2820,15 +2467,9 @@ class RAGService:
                 "chunk_size": self.chunk_size,
                 "chunk_overlap": self.chunk_overlap,
                 "parent_chunk_size": (
-                    self.parent_chunk_size
-                    if record_strategy == CHUNKING_STRATEGY
-                    else 0  # 旧版无父子分块
+                    self.parent_chunk_size if record_strategy == CHUNKING_STRATEGY else 0  # 旧版无父子分块
                 ),
-                "parent_chunk_overlap": (
-                    self.parent_chunk_overlap
-                    if record_strategy == CHUNKING_STRATEGY
-                    else 0
-                ),
+                "parent_chunk_overlap": (self.parent_chunk_overlap if record_strategy == CHUNKING_STRATEGY else 0),
                 "chunking_strategy": record_strategy or "legacy_flat",
                 "embedding_strategy": MULTI_VECTOR_STRATEGY,
                 "embedding_types": list(MULTI_VECTOR_TYPES),

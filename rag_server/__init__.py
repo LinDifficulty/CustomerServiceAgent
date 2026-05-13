@@ -24,11 +24,11 @@ from .eval_service import evaluate_retrieval_dataset, load_retrieval_eval_datase
 # ── LLM 重试策略 ──
 from .llm_retry import LLMRetryError, LLMRetryPolicy
 
-# ── 用户记忆服务 ──
-from .memory_service import LLMMemoryExtractor, MEMORY_LAYERS, MemoryService
-
 # ── MCP 客户端配置与工具加载 ──
 from .mcp_service import MCPConfig, MCPToolLoadResult, load_mcp_config
+
+# ── 用户记忆服务 ──
+from .memory_service import MEMORY_LAYERS, LLMMemoryExtractor, MemoryService
 
 # ── 模型工厂 ──
 from .model_factory import ModelProviderError

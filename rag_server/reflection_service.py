@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,7 +10,7 @@ from .llm_retry import LLMRetryPolicy, ainvoke_with_retry
 from .model_factory import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, create_chat_model
 from .rag_service import RAGService
 from .trace_service import TraceRecorder, preview_text, summarize_result
-from .utils import coerce_bool, coerce_message_content, parse_json_object
+from .utils import coerce_bool, coerce_message_content, parse_json_object, trace_retry_failure
 
 # 默认使用与 Agent 对话模型相同的模型进行反思审校
 DEFAULT_REFLECTION_MODEL = DEFAULT_CHAT_MODEL
@@ -23,12 +24,12 @@ class ReflectionResult:
     用于驱动后续的补充检索和回答修正流程。
     """
 
-    has_hallucination: bool       # 初次回答是否包含未被证据支持的幻觉内容
-    needs_more_evidence: bool     # 是否需要补充更多证据来支撑回答
-    reason: str                   # 一句话说明审校结论的原因
-    search_query: str             # 如果需要补检索，此字段包含精简的检索问题
-    correction_guidance: str      # 如果需要修正，说明应该删除或修改什么内容
-    raw_response: str             # LLM 返回的原始文本，便于调试追踪
+    has_hallucination: bool  # 初次回答是否包含未被证据支持的幻觉内容
+    needs_more_evidence: bool  # 是否需要补充更多证据来支撑回答
+    reason: str  # 一句话说明审校结论的原因
+    search_query: str  # 如果需要补检索，此字段包含精简的检索问题
+    correction_guidance: str  # 如果需要修正，说明应该删除或修改什么内容
+    raw_response: str  # LLM 返回的原始文本，便于调试追踪
 
     @property
     def needs_revision(self) -> bool:
@@ -120,9 +121,7 @@ class ReflectionAgent:
             return initial_answer
 
         # 步骤 3：需要修正，先进行补充检索获取更多证据
-        supplemental_context = self._supplemental_retrieval(
-            reflection.search_query or user_question
-        )
+        supplemental_context = await self._supplemental_retrieval(reflection.search_query or user_question)
         # 如果补充检索也没有获取到任何证据，记录告警并回退
         if not supplemental_context and not evidence_context:
             self._trace_event(
@@ -277,7 +276,7 @@ class ReflectionAgent:
         # 如果修正后的回答为空，回退到原始回答
         return revised_answer or initial_answer
 
-    def _supplemental_retrieval(self, query: str) -> str:
+    async def _supplemental_retrieval(self, query: str) -> str:
         """根据审校推荐的检索问题，从知识库中补充检索证据。
 
         如果检索失败或返回空结果，记录告警并返回空字符串，
@@ -287,7 +286,8 @@ class ReflectionAgent:
             return ""
         try:
             # 使用基础检索方法（不使用 BM25 和 rerank，保持快速）
-            results = self.rag.search(
+            results = await asyncio.to_thread(
+                self.rag.search,
                 query=query,
                 top_k=self.supplemental_top_k,
                 candidate_top_k=self.supplemental_candidate_top_k,
@@ -307,23 +307,20 @@ class ReflectionAgent:
             {
                 "query": query,
                 "result_count": len(results),
-                "results": [
-                    summarize_result(item, include_content=True)
-                    for item in results
-                ],
+                "results": [summarize_result(item, include_content=True) for item in results],
             },
         )
         return context
 
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
-        """记录 LLM 调用重试失败事件。
-
-        根据是否会继续重试使用不同的日志级别（warning/error）。
-        """
-        self._trace_event(
+        """记录 LLM 调用重试失败事件。"""
+        trace_retry_failure(
+            self.trace_recorder,
+            "reflection",
             "reflection.model_retry",
-            {"provider": self.provider, "model_name": self.model_name, **event},
-            level="warning" if event.get("will_retry") else "error",
+            self.provider,
+            self.model_name,
+            event,
         )
 
     def _trace_event(

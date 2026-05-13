@@ -4,10 +4,11 @@ import json
 import time
 import uuid
 from collections import Counter
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 from .utils import utc_now
 
@@ -280,17 +281,9 @@ def summarize_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
     # 统计各事件名称数量，取 top 10
     names = Counter(str(item.get("name") or "") for item in records)
     # 收集所有有效耗时（毫秒）
-    elapsed_values = [
-        float(item["elapsed_ms"])
-        for item in records
-        if isinstance(item.get("elapsed_ms"), int | float)
-    ]
+    elapsed_values = [float(item["elapsed_ms"]) for item in records if isinstance(item.get("elapsed_ms"), int | float)]
     # 收集所有时间戳
-    timestamps = [
-        str(item.get("timestamp"))
-        for item in records
-        if item.get("timestamp")
-    ]
+    timestamps = [str(item.get("timestamp")) for item in records if item.get("timestamp")]
     return {
         "event_count": len(records),  # 事件总数
         "levels": dict(sorted(levels.items())),  # 各级别分布

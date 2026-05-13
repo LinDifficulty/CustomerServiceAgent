@@ -121,7 +121,7 @@ class CLIConfigTests(unittest.TestCase):
         stream = Mock()
         stream.isatty.return_value = True
 
-        with patch("rag_server.cli.os.system") as system:
+        with patch("rag_server.cli_view.os.system") as system:
             clear_terminal_startup(stream)
 
         system.assert_called_once_with("clear")
@@ -131,7 +131,7 @@ class CLIConfigTests(unittest.TestCase):
         stream = Mock()
         stream.isatty.return_value = False
 
-        with patch("rag_server.cli.os.system") as system:
+        with patch("rag_server.cli_view.os.system") as system:
             clear_terminal_startup(stream)
 
         system.assert_not_called()

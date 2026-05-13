@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
+
 # ThreadPoolExecutor: 用于在同步调用中实现超时控制
 # TimeoutError as FutureTimeoutError: 区分线程池超时和 asyncio 超时
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass  # 用于定义不可变配置数据类
-from typing import Any, Awaitable, Callable, TypeVar
-
-# 泛型变量，用于保持重试调用返回值类型的一致性
-T = TypeVar("T")
+from typing import Any
 
 # 重试事件的类型别名：一个包含重试信息的字典
 RetryEvent = dict[str, Any]
@@ -32,7 +32,7 @@ class LLMRetryPolicy:
     max_backoff_s: float = 8.0
     """单次退避等待的最大秒数上限。"""
 
-    def normalized(self) -> "LLMRetryPolicy":
+    def normalized(self) -> LLMRetryPolicy:
         """返回规范化的重试策略——将所有参数钳制到合理范围内。"""
         timeout = self.per_attempt_timeout_s
         return LLMRetryPolicy(
@@ -56,9 +56,7 @@ class LLMRetryPolicy:
         if self.initial_backoff_s <= 0:
             return 0.0
         # 指数退避公式: initial_backoff * (multiplier ^ (failure_index - 1))
-        backoff = self.initial_backoff_s * (
-            self.backoff_multiplier ** max(0, failure_index - 1)
-        )
+        backoff = self.initial_backoff_s * (self.backoff_multiplier ** max(0, failure_index - 1))
         # 退避时间不超过上限
         return min(backoff, self.max_backoff_s)
 
@@ -69,16 +67,14 @@ class LLMRetryError(RuntimeError):
     def __init__(
         self,
         *,
-        operation: str,         # 操作名称（如 "llm.invoke"）
-        attempts: int,          # 已尝试的次数
+        operation: str,  # 操作名称（如 "llm.invoke"）
+        attempts: int,  # 已尝试的次数
         last_error: BaseException,  # 最后一次捕获的异常
     ) -> None:
         self.operation = operation
         self.attempts = attempts
         self.last_error = last_error
-        super().__init__(
-            f"{operation} failed after {attempts} attempt(s): {last_error!r}"
-        )
+        super().__init__(f"{operation} failed after {attempts} attempt(s): {last_error!r}")
 
 
 def is_retryable_llm_error(error: BaseException) -> bool:
@@ -108,24 +104,24 @@ def is_retryable_llm_error(error: BaseException) -> bool:
 
     # 匹配常见瞬时性错误关键词
     retry_markers = (
-        "timeout",           # 超时
-        "timed out",         # 超时（短语）
-        "temporarily",       # 临时
-        "temporary",         # 临时
-        "rate limit",        # 频率限制
-        "ratelimit",         # 频率限制（连写）
-        "too many requests", # 请求过多
-        "throttle",          # 限流
-        "throttling",        # 限流中
-        "connection",        # 连接错误
-        "connect",           # 连接错误（变体）
-        "reset by peer",     # 对端重置连接
-        "unavailable",       # 服务不可用
-        "overloaded",        # 过载
-        "server error",      # 服务器错误
-        "bad gateway",       # 网关错误
+        "timeout",  # 超时
+        "timed out",  # 超时（短语）
+        "temporarily",  # 临时
+        "temporary",  # 临时
+        "rate limit",  # 频率限制
+        "ratelimit",  # 频率限制（连写）
+        "too many requests",  # 请求过多
+        "throttle",  # 限流
+        "throttling",  # 限流中
+        "connection",  # 连接错误
+        "connect",  # 连接错误（变体）
+        "reset by peer",  # 对端重置连接
+        "unavailable",  # 服务不可用
+        "overloaded",  # 过载
+        "server error",  # 服务器错误
+        "bad gateway",  # 网关错误
         "service unavailable",  # 服务不可用
-        "gateway timeout",   # 网关超时
+        "gateway timeout",  # 网关超时
     )
     # 只要异常文本中包含任一关键词，就认为是可重试的
     return any(marker in text for marker in retry_markers)
@@ -161,7 +157,7 @@ def _classify_attempt_error(
     return will_retry, sleep_s
 
 
-def invoke_with_retry(
+def invoke_with_retry[T](
     invoke: Callable[[], T],
     *,
     retry_policy: LLMRetryPolicy | None = None,
@@ -189,9 +185,7 @@ def invoke_with_retry(
             return _invoke_sync_with_timeout(invoke, policy.per_attempt_timeout_s)
         except Exception as error:
             last_error = error
-            will_retry, sleep_s = _classify_attempt_error(
-                error, attempt, policy, operation, on_failure, start
-            )
+            will_retry, sleep_s = _classify_attempt_error(error, attempt, policy, operation, on_failure, start)
             if not will_retry:
                 break
             time.sleep(sleep_s)
@@ -203,7 +197,7 @@ def invoke_with_retry(
     ) from last_error
 
 
-async def ainvoke_with_retry(
+async def ainvoke_with_retry[T](
     invoke: Callable[[], Awaitable[T]],
     *,
     retry_policy: LLMRetryPolicy | None = None,
@@ -237,9 +231,7 @@ async def ainvoke_with_retry(
             )
         except Exception as error:
             last_error = error
-            will_retry, sleep_s = _classify_attempt_error(
-                error, attempt, policy, operation, on_failure, start
-            )
+            will_retry, sleep_s = _classify_attempt_error(error, attempt, policy, operation, on_failure, start)
             if not will_retry:
                 break
             await asyncio.sleep(sleep_s)
@@ -251,7 +243,7 @@ async def ainvoke_with_retry(
     ) from last_error
 
 
-def _invoke_sync_with_timeout(
+def _invoke_sync_with_timeout[T](
     invoke: Callable[[], T],
     timeout_s: float | None,
 ) -> T:
@@ -317,8 +309,8 @@ def _extract_status_code(error: BaseException) -> int | None:
     """
     # 依次尝试多个可能的属性路径
     for candidate in (
-        getattr(error, "status_code", None),       # 直接属性
-        getattr(error, "status", None),             # 简写形式
+        getattr(error, "status_code", None),  # 直接属性
+        getattr(error, "status", None),  # 简写形式
         getattr(getattr(error, "response", None), "status_code", None),  # response 子对象
     ):
         try:

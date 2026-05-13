@@ -15,8 +15,6 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from .utils import coerce_bool
 
-# 默认的 MCP 配置文件路径
-DEFAULT_MCP_CONFIG_PATH = "mcp_servers.json"
 # 服务器名称校验正则：仅允许字母、数字、下划线和连字符，长度 1-64
 SERVER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # 环境变量占位符正则：匹配 ${VAR_NAME} 或 ${VAR_NAME:-默认值} 格式
@@ -107,11 +105,7 @@ def load_mcp_config(config_path: str | Path) -> MCPConfig:
     if raw_servers is None:
         # 向后兼容：如果没有 "servers" 顶层键，则从根对象中自动识别服务器配置
         # 判断依据：值为 dict 且包含 "transport" 键
-        raw_servers = {
-            key: value
-            for key, value in payload.items()
-            if isinstance(value, dict) and "transport" in value
-        }
+        raw_servers = {key: value for key, value in payload.items() if isinstance(value, dict) and "transport" in value}
     if not isinstance(raw_servers, dict):
         raise ValueError("MCP config field 'servers' must be an object")
 
@@ -138,10 +132,7 @@ def _normalize_connection(
     """
     # 校验服务器名称格式：仅允许字母、数字、下划线、连字符，1-64 字符
     if not SERVER_NAME_PATTERN.fullmatch(server_name):
-        raise ValueError(
-            f"Invalid MCP server name '{server_name}'. "
-            "Use letters, numbers, underscores, or hyphens."
-        )
+        raise ValueError(f"Invalid MCP server name '{server_name}'. Use letters, numbers, underscores, or hyphens.")
     # 连接配置必须是字典类型
     if not isinstance(raw_connection, dict):
         raise ValueError(f"MCP server '{server_name}' config must be an object")
@@ -150,18 +141,12 @@ def _normalize_connection(
         return None
 
     # 展开配置值中的所有环境变量占位符（跳过 "enabled" 字段）
-    connection = {
-        key: _expand_env_vars(value)
-        for key, value in raw_connection.items()
-        if key != "enabled"
-    }
+    connection = {key: _expand_env_vars(value) for key, value in raw_connection.items() if key != "enabled"}
     # 规范化传输协议名称：将 "streamable-http" 转换为 "streamable_http"
     transport = str(connection.get("transport") or "").strip()
     transport = "streamable_http" if transport == "streamable-http" else transport
     if transport not in SUPPORTED_TRANSPORTS:
-        raise ValueError(
-            f"MCP server '{server_name}' has unsupported transport: {transport!r}"
-        )
+        raise ValueError(f"MCP server '{server_name}' has unsupported transport: {transport!r}")
     connection["transport"] = transport
 
     # 根据传输类型执行不同的校验
@@ -198,17 +183,13 @@ def _validate_stdio_connection(
     # args 如果提供则必须是列表，所有元素转为字符串
     args = connection.get("args", [])
     if not isinstance(args, list):
-        raise ValueError(
-            f"MCP stdio server '{server_name}' field 'args' must be a list"
-        )
+        raise ValueError(f"MCP stdio server '{server_name}' field 'args' must be a list")
     connection["args"] = [str(item) for item in args]
 
     # env 如果提供则必须是字典，所有键值转为字符串
     env = connection.get("env")
     if env is not None and not isinstance(env, dict):
-        raise ValueError(
-            f"MCP stdio server '{server_name}' field 'env' must be an object"
-        )
+        raise ValueError(f"MCP stdio server '{server_name}' field 'env' must be an object")
     if isinstance(env, dict):
         connection["env"] = {str(key): str(value) for key, value in env.items()}
 
@@ -232,9 +213,7 @@ def _validate_url_connection(
     # headers 如果提供则必须是字典类型
     headers = connection.get("headers")
     if headers is not None and not isinstance(headers, dict):
-        raise ValueError(
-            f"MCP server '{server_name}' field 'headers' must be an object"
-        )
+        raise ValueError(f"MCP server '{server_name}' field 'headers' must be an object")
 
 
 def _coerce_http_timeouts(connection: dict[str, Any]) -> None:
@@ -275,8 +254,8 @@ def _replace_env_var(match: re.Match[str]) -> str:
     - ${VAR_NAME} — 必须存在，否则报错
     - ${VAR_NAME:-default} — 不存在时使用默认值
     """
-    name = match.group(1)       # 环境变量名
-    default = match.group(2)    # 默认值（可选，在 :- 之后）
+    name = match.group(1)  # 环境变量名
+    default = match.group(2)  # 默认值（可选，在 :- 之后）
     value = os.environ.get(name)
     if value is not None:
         return value

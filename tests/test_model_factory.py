@@ -12,11 +12,12 @@ import unittest
 
 from rag_server.model_factory import create_chat_model, create_embeddings, create_reranker
 
-
 # --- 测试用 Fake Provider 类 ---
+
 
 class FakeChatProvider:
     """模拟聊天模型 Provider：记录 model 名称和 temperature。"""
+
     def __init__(self, model: str, temperature: float = 0.0) -> None:
         self.model = model
         self.temperature = temperature
@@ -24,6 +25,7 @@ class FakeChatProvider:
 
 class FakeEmbeddingProvider:
     """模拟嵌入模型 Provider：记录 model_name 和 dimensions，返回全 1 向量。"""
+
     def __init__(self, model_name: str, dimensions: int = 3) -> None:
         self.model_name = model_name
         self.dimensions = dimensions
@@ -34,6 +36,7 @@ class FakeEmbeddingProvider:
 
 class FakeRerankerProvider:
     """模拟重排序模型 Provider：记录 model_name_or_path 和 device。"""
+
     def __init__(self, model_name_or_path: str, device: str | None = None) -> None:
         self.model_name_or_path = model_name_or_path
         self.device = device

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import unittest
 
-from rag_server.utils import coerce_bool, coerce_message_content, parse_json_object
+from rag_server.utils import coerce_bool, coerce_message_content, normalize_vector_score, parse_json_object, utc_now
 
 
 class CoerceMessageContentTests(unittest.TestCase):
@@ -79,6 +79,50 @@ class CoerceBoolTests(unittest.TestCase):
     # 验证未知字符串回退到 Python 内置 bool() 判断（非空字符串为 True）
     def test_unknown_string_uses_bool(self) -> None:
         self.assertTrue(coerce_bool("unknown"))
+
+    # 验证 strict 模式下未知值抛出 ValueError
+    def test_strict_unknown_value_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            coerce_bool("unknown", strict=True)
+
+    # 验证 strict 模式下非布尔/字符串类型抛出错误
+    def test_strict_non_bool_type_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            coerce_bool(42, strict=True)
+
+
+class ParseJsonObjectMarkdownTests(unittest.TestCase):
+    # 验证从 markdown 代码块中提取 JSON
+    def test_extract_from_markdown_fence(self) -> None:
+        result = parse_json_object('```json\n{"key": "value"}\n```')
+        self.assertEqual(result, {"key": "value"})
+
+    # 验证从无语言标签的代码块中提取 JSON
+    def test_extract_from_plain_fence(self) -> None:
+        result = parse_json_object('```\n{"a": 1}\n```')
+        self.assertEqual(result, {"a": 1})
+
+
+class NormalizeVectorScoreTests(unittest.TestCase):
+    # L2 归一化向量的内积范围 [-1, 1] 应映射到 [0, 1]
+    def test_range_mapping(self) -> None:
+        self.assertAlmostEqual(normalize_vector_score(-1.0), 0.0)
+        self.assertAlmostEqual(normalize_vector_score(0.0), 0.5)
+        self.assertAlmostEqual(normalize_vector_score(1.0), 1.0)
+
+    # 超出范围的值应被钳制
+    def test_clamping(self) -> None:
+        self.assertAlmostEqual(normalize_vector_score(-2.0), 0.0)
+        self.assertAlmostEqual(normalize_vector_score(2.0), 1.0)
+
+
+class UtcNowTests(unittest.TestCase):
+    # UTC 时间字符串应符合 ISO 8601 格式
+    def test_utc_now_format(self) -> None:
+        result = utc_now()
+        self.assertIsInstance(result, str)
+        self.assertIn("T", result)
+        self.assertIn("+00:00", result)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from .trace_service import preview_text
+from .trace_service import TraceRecorder, preview_text
 from .utils import coerce_bool
 
 # ---- 常量定义 ----
@@ -36,10 +36,10 @@ class SkillDefinition:
     先只暴露 frontmatter 元数据，用户按需加载完整内容。
     """
 
-    name: str                    # Skill 名称，必须与目录名一致
-    description: str             # Skill 简要描述
-    body: str                    # SKILL.md 正文（frontmatter 之后的部分）
-    path: Path                   # SKILL.md 文件的绝对路径
+    name: str  # Skill 名称，必须与目录名一致
+    description: str  # Skill 简要描述
+    body: str  # SKILL.md 正文（frontmatter 之后的部分）
+    path: Path  # SKILL.md 文件的绝对路径
     frontmatter: dict[str, Any]  # 解析后的 YAML frontmatter 元数据
 
     @property
@@ -145,6 +145,9 @@ class SkillRegistry:
         self.skill_dirs = [Path(item) for item in (skill_dirs or [])]
         # 错误收集列表：记录发现/加载过程中的错误，但不中断整体流程
         self.errors: list[str] = []
+        # 文件系统缓存：避免每次请求都扫描磁盘和解析 SKILL.md
+        self._skills_cache: list[SkillDefinition] | None = None
+        self._skills_cache_mtime: float = 0.0
 
     @classmethod
     def from_project_root(
@@ -164,13 +167,30 @@ class SkillRegistry:
             skill_dirs.extend(extra_skill_dirs)
         return cls(skill_dirs)
 
+    def _skills_files_mtime(self) -> float:
+        """返回所有 skill 目录下 SKILL.md 文件的最大 mtime，用于缓存失效判断。"""
+        max_mtime = 0.0
+        for skill_dir in self.skill_dirs:
+            base_dir = skill_dir.expanduser()
+            if not base_dir.is_dir():
+                continue
+            for path in base_dir.glob(f"*/{ANTHROPIC_SKILL_FILENAME}"):
+                mtime = path.stat().st_mtime
+                if mtime > max_mtime:
+                    max_mtime = mtime
+        return max_mtime
+
     def list_skills(self) -> list[SkillDefinition]:
         """扫描所有 skill 目录，返回所有有效的 Skill 定义列表。
 
-        每次调用都会重新扫描并清空之前的错误列表。
-        按 skill 名称的字母顺序排列，发现重复 skill 时仅保留第一个，
-        后续同名 skill 会被忽略并记录错误。
+        首次调用扫描磁盘并缓存结果；后续调用仅在 SKILL.md 文件 mtime 变更时重新扫描。
+        按 skill 名称的字母顺序排列。
         """
+        # 检查缓存是否有效（文件未被修改）
+        current_mtime = self._skills_files_mtime()
+        if self._skills_cache is not None and current_mtime <= self._skills_cache_mtime:
+            return self._skills_cache
+
         self.errors = []  # 每次扫描前清空错误列表
         skills: dict[str, SkillDefinition] = {}
 
@@ -196,14 +216,14 @@ class SkillRegistry:
 
                 # 同名 skill 去重：先到先得，后续记录错误并跳过
                 if skill.name in skills:
-                    self.errors.append(
-                        f"{path}: duplicate skill name '{skill.name}', ignored"
-                    )
+                    self.errors.append(f"{path}: duplicate skill name '{skill.name}', ignored")
                     continue
                 skills[skill.name] = skill
 
-        # 按名称排序返回
-        return sorted(skills.values(), key=lambda item: item.name)
+        # 更新缓存
+        self._skills_cache = sorted(skills.values(), key=lambda item: item.name)
+        self._skills_cache_mtime = current_mtime
+        return self._skills_cache
 
     def get_skill(self, name: str) -> SkillDefinition | None:
         """根据名称查找一个 Skill 定义。
@@ -224,11 +244,7 @@ class SkillRegistry:
         Agent 需要时再调用 load_skill 加载完整内容。
         """
         # 过滤掉禁止模型自动调用的 skill
-        skills = [
-            skill
-            for skill in self.list_skills()
-            if not skill.disable_model_invocation
-        ]
+        skills = [skill for skill in self.list_skills() if not skill.disable_model_invocation]
         if not skills:
             return ""
 
@@ -274,8 +290,7 @@ class SkillRegistry:
         # 生成上下文，提示 Agent 忽略命令前缀并遵循 skill 指令
         return "\n".join(
             [
-                f"用户显式调用了 /{name} skill。请忽略消息开头的 /{name} 命令前缀，"
-                "并优先遵循下面的 skill 内容。",
+                f"用户显式调用了 /{name} skill。请忽略消息开头的 /{name} 命令前缀，并优先遵循下面的 skill 内容。",
                 "",
                 skill.render(self.list_supporting_files(name)),
             ]
@@ -378,9 +393,7 @@ class SkillRegistry:
         # frontmatter 中的 name 必须与 skill 目录名一致
         directory_name = path.parent.name
         if raw_name != directory_name:
-            raise ValueError(
-                f"frontmatter name '{raw_name}' must match directory '{directory_name}'"
-            )
+            raise ValueError(f"frontmatter name '{raw_name}' must match directory '{directory_name}'")
 
         return SkillDefinition(
             name=raw_name,
@@ -394,7 +407,7 @@ class SkillRegistry:
 def build_skill_tools(
     skill_registry: SkillRegistry,
     *,
-    trace_recorder: Any | None = None,
+    trace_recorder: TraceRecorder | None = None,
 ):
     """将 Skill 按需加载能力暴露为 LangChain 工具函数。
 
@@ -480,6 +493,7 @@ def build_skill_tools(
 
 # ---- 内部辅助函数 ----
 
+
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     """从 SKILL.md 文件中分离 YAML frontmatter 和正文。
 
@@ -540,8 +554,11 @@ def _parse_simple_yaml(lines: list[str]) -> dict[str, Any]:
                     payload[current_key] = existing
                 existing.append(_coerce_scalar(item[2:].strip()))
             elif isinstance(payload.get(current_key), str):
-                # 多行字符串：拼接到当前键的值后面
-                payload[current_key] = f"{payload[current_key]}\n{item}"
+                # 多行字符串：拼接到当前键的值后面（避免首行出现前导换行）
+                if payload[current_key]:
+                    payload[current_key] = f"{payload[current_key]}\n{item}"
+                else:
+                    payload[current_key] = item
             continue
 
         # 新键值对行：必须包含 ':' 分隔符
@@ -582,9 +599,7 @@ def _coerce_scalar(value: str) -> Any:
         return ""
 
     # 处理引号包裹的字符串（单引号或双引号）
-    if (value.startswith('"') and value.endswith('"')) or (
-        value.startswith("'") and value.endswith("'")
-    ):
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
         return value[1:-1]
     # 处理布尔值
     if value.lower() in {"true", "false"}:
@@ -611,9 +626,7 @@ def _validate_skill_metadata(name: str, description: str) -> None:
     if not name:
         raise ValueError("frontmatter field 'name' is required")
     if not SKILL_NAME_PATTERN.fullmatch(name):
-        raise ValueError(
-            "skill name must be lowercase letters, numbers, and hyphens only"
-        )
+        raise ValueError("skill name must be lowercase letters, numbers, and hyphens only")
     # 检查是否包含保留名称片段，防止冒充系统 skill
     if any(part in name for part in RESERVED_SKILL_NAME_PARTS):
         raise ValueError("skill name must not contain reserved words")

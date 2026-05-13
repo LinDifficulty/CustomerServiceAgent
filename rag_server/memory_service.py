@@ -1,40 +1,50 @@
-# -*- coding: utf-8 -*-
 # 用户长期记忆模块：SQLite持久化 + 按用户的FAISS语义索引 + 三层记忆体系
 # 三层记忆：profile（用户画像）、episode（对话片段）、procedure（操作流程）
 # 支持软删除（deleted_at时间戳）、过期管理（expires_at）、LLM记忆抽取
 from __future__ import annotations
 
-import asyncio         # 异步IO，支持并发记忆搜索
-import hashlib          # SHA256哈希，为每个用户生成索引文件名
-import json             # 序列化/反序列化metadata和索引ID
-import os               # 文件路径和环境变量
-import sqlite3          # 结构化记忆存储
-import threading        # 线程锁，保证FAISS索引读写的线程安全
-import time             # 性能计时
-import uuid             # 为每条记忆生成全局唯一ID
+import asyncio  # 异步IO，支持并发记忆搜索
+import hashlib  # SHA256哈希，为每个用户生成索引文件名
+import json  # 序列化/反序列化metadata和索引ID
+import os  # 文件路径和环境变量
+import sqlite3  # 结构化记忆存储
+import threading  # 线程锁，保证FAISS索引读写的线程安全
+import time  # 性能计时
+import uuid  # 为每条记忆生成全局唯一ID
 from dataclasses import dataclass  # ExtractedMemory数据类
+from datetime import UTC, datetime
 from pathlib import Path  # 跨平台路径处理
 from typing import Any
 
 # 解决macOS上OpenMP库冲突问题，避免FAISS初始化时报错
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-import faiss          # Facebook AI Similarity Search，高性能向量索引和相似度搜索
-import numpy as np     # 数值计算库，用于向量矩阵操作
+import faiss  # Facebook AI Similarity Search，高性能向量索引和相似度搜索
+import numpy as np  # 数值计算库，用于向量矩阵操作
 from langchain_core.messages import HumanMessage, SystemMessage  # LLM消息类型
 
-from .cache_service import CacheTTLs, JsonCache, stable_cache_digest  # 缓存服务和缓存键生成
+from .cache_service import CacheTTLs, JsonCache, read_cached_list, stable_cache_digest, write_cached_list
 from .llm_retry import LLMRetryPolicy, ainvoke_with_retry, invoke_with_retry  # LLM调用重试策略
 from .model_factory import (
-    DEFAULT_CHAT_MODEL,            # 默认聊天模型
-    DEFAULT_CHAT_PROVIDER,         # 默认聊天模型提供商（DashScope）
-    DEFAULT_EMBEDDING_MODEL,       # 默认Embedding模型
-    DEFAULT_EMBEDDING_PROVIDER,    # 默认Embedding提供商
-    create_chat_model,             # 模型工厂函数
-    create_embeddings,             # Embeddings工厂函数
-    model_config_fingerprint,      # 模型配置指纹，用于检测配置变更
+    DEFAULT_CHAT_MODEL,  # 默认聊天模型
+    DEFAULT_CHAT_PROVIDER,  # 默认聊天模型提供商（DashScope）
+    DEFAULT_EMBEDDING_MODEL,  # 默认Embedding模型
+    DEFAULT_EMBEDDING_PROVIDER,  # 默认Embedding提供商
+    create_chat_model,  # 模型工厂函数
+    create_embeddings,  # Embeddings工厂函数
+    model_config_fingerprint,  # 模型配置指纹，用于检测配置变更
 )
-from .utils import cache_key_or_none, coerce_message_content, load_prompt, parse_json_object, utc_now
+from .trace_service import TraceRecorder
+from .utils import (
+    cache_key_or_none,
+    call_async_fallback,
+    coerce_message_content,
+    load_prompt,
+    normalize_vector_score,
+    parse_json_object,
+    trace_retry_failure,
+    utc_now,
+)
 
 # 所有合法的记忆类型（memory_type）
 # profile: 用户画像/身份信息 | preference: 偏好/喜好 | constraint: 限制条件
@@ -103,7 +113,7 @@ class MemoryService:
         embedding_model_name: str | None = None,
         embedding_model_kwargs: dict[str, Any] | None = None,
         embeddings: Any | None = None,
-        trace_recorder: Any | None = None,
+        trace_recorder: TraceRecorder | None = None,
         cache: JsonCache | None = None,
         cache_ttls: dict[str, Any] | None = None,
     ) -> None:
@@ -157,6 +167,10 @@ class MemoryService:
         # 内存中的索引缓存：{user_id: (faiss_index, id_list)}
         # 避免每次搜索都从磁盘加载FAISS索引
         self._index_cache: dict[str, tuple[faiss.Index | None, list[str]]] = {}
+        # 缓存版本号 TTL 缓存：{user_id: (version_string, timestamp)}
+        # 5秒内重复查询复用同一版本号，避免每层搜索都执行聚合 SQL
+        self._version_cache: dict[str, tuple[str, float]] = {}
+        self._version_cache_ttl: float = 5.0
         # 可重入锁，保证多线程下索引读写的安全性
         self._lock = threading.RLock()
 
@@ -164,8 +178,17 @@ class MemoryService:
         self.conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         # 设置行工厂为sqlite3.Row，使查询结果可以通过列名访问
         self.conn.row_factory = sqlite3.Row
-        self._init_db()              # 创建表和索引
+        self._init_db()  # 创建表和索引
         self._ensure_embedding_config()  # 验证或重建Embedding配置
+
+    def __enter__(self) -> MemoryService:
+        """上下文管理器入口，支持 `with MemoryService(...) as svc:` 语法。"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """上下文管理器出口，自动关闭数据库连接。"""
+        self.close()
+        return False
 
     def add_memory(
         self,
@@ -253,7 +276,7 @@ class MemoryService:
             # 构建标准化的记忆记录
             inserted.append(
                 {
-                    "id": str(uuid.uuid4()),       # 为每条记忆生成全局唯一ID
+                    "id": str(uuid.uuid4()),  # 为每条记忆生成全局唯一ID
                     "user_id": user_id,
                     "content": content,
                     "memory_type": memory_type,
@@ -302,6 +325,7 @@ class MemoryService:
 
             # 重建该用户的FAISS语义索引以包含新记忆
             self._rebuild_user_index(user_id)
+            self._invalidate_version_cache(user_id)
             # 返回插入后的完整记录（重新从数据库读取以获取最新状态）
             return [self.get_memory(item["id"]) for item in inserted]
 
@@ -330,6 +354,36 @@ class MemoryService:
         if row is None or self._is_expired(row):
             return None
         return self._row_to_record(row)
+
+    def _batch_get_memories(
+        self,
+        memory_ids: list[str],
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, dict]:
+        """批量获取记忆记录，一次 SQL 查询替代 N 次单独查询。
+
+        返回 {memory_id: record_dict} 字典，未找到或已过期/已删除的记录不包含在内。
+        """
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        params: list[Any] = list(memory_ids)
+        where = ["id IN (" + placeholders + ")", "deleted_at IS NULL"]
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM memories WHERE {' AND '.join(where)} ORDER BY id",
+                params,
+            ).fetchall()
+        result: dict[str, dict] = {}
+        for row in rows:
+            if self._is_expired(row):
+                continue
+            result[row["id"]] = self._row_to_record(row)
+        return result
 
     def list_memories(
         self,
@@ -360,7 +414,7 @@ class MemoryService:
             rows = self.conn.execute(
                 f"""
                 SELECT * FROM memories
-                WHERE {' AND '.join(where)}
+                WHERE {" AND ".join(where)}
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
@@ -436,7 +490,7 @@ class MemoryService:
             min_score=min_score,
             allowed_types=allowed_types,
         )
-        cached_results = self._read_cached_memory_results(cache_payload)
+        cached_results = read_cached_list(self.cache, "memory_search",cache_payload)
         if cached_results is not None:
             # 缓存命中：直接返回缓存结果，节省Embedding调用和FAISS搜索
             self._trace_search_memory(
@@ -482,33 +536,39 @@ class MemoryService:
         # 将查询文本向量化并在FAISS索引中搜索
         scores, indices = index.search(self._embed_texts([query]), limit)
 
-        # 遍历FAISS返回的候选结果，逐一验证和过滤
-        results: list[dict] = []
-        seen: set[str] = set()  # 去重：避免同一个memory_id出现多次
-        for raw_score, idx in zip(scores[0], indices[0], strict=False):
-            # FAISS可能返回 -1 表示无效索引
+        # 收集所有有效候选的 memory_id（去重），用于批量验证
+        candidate_scores: dict[str, float] = {}
+        candidate_order: list[str] = []  # 保持 FAISS 返回的原始顺序
+        for raw_score, idx in zip(scores[0], indices[0], strict=True):
             if idx < 0 or idx >= len(index_ids):
                 continue
-
             memory_id = index_ids[int(idx)]
+            if memory_id in candidate_scores:
+                continue
+            candidate_scores[memory_id] = normalize_vector_score(float(raw_score))
+            candidate_order.append(memory_id)
+
+        if not candidate_order:
+            write_cached_list(self.cache, "memory_search", cache_payload, [], self.cache_ttls.memory_ttl_s)
+            return []
+
+        # 用 batch get 替代逐个 get_memory，大幅减少 SQL 往返
+        batch_records = self._batch_get_memories(candidate_order, user_id=user_id)
+
+        results: list[dict] = []
+        seen: set[str] = set()
+        for memory_id in candidate_order:
+            score = candidate_scores[memory_id]
+            if score < min_score:
+                continue
+            record = batch_records.get(memory_id)
+            if record is None:
+                continue
             if memory_id in seen:
                 continue
             seen.add(memory_id)
-
-            # 从SQLite获取最新的记录状态（验证未删除、未过期）
-            record = self.get_memory(memory_id, user_id=user_id)
-            if record is None:
-                continue
             # 按记忆类型过滤
-            if (
-                allowed_types is not None
-                and record["memory_type"] not in allowed_types
-            ):
-                continue
-
-            # 将FAISS内积分数归一化到 [0, 1] 区间
-            score = self._normalize_vector_score(float(raw_score))
-            if score < min_score:
+            if allowed_types is not None and record["memory_type"] not in allowed_types:
                 continue
             record["score"] = score
             results.append(record)
@@ -520,7 +580,7 @@ class MemoryService:
         # 按分数降序排列
         results.sort(key=lambda item: item["score"], reverse=True)
         # 将结果写入缓存以供后续查询复用
-        self._write_cached_memory_results(cache_payload, results)
+        write_cached_list(self.cache, "memory_search", cache_payload, results, self.cache_ttls.memory_ttl_s)
         # 记录搜索追踪事件
         self._trace_search_memory(
             user_id=user_id,
@@ -614,9 +674,7 @@ class MemoryService:
                 "query": query,
                 "layer_top_k": limits,
                 "min_score": min_score,
-                "layer_counts": {
-                    layer: len(items) for layer, items in layered.items()
-                },
+                "layer_counts": {layer: len(items) for layer, items in layered.items()},
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
             },
         )
@@ -647,6 +705,9 @@ class MemoryService:
         # 合并自定义与默认的每层召回数量
         limits = {**DEFAULT_MEMORY_LAYER_TOP_K, **(layer_top_k or {})}
 
+        # 预先嵌入查询向量：避免 3 个并发层在冷缓存时同时调用 API
+        await asyncio.to_thread(self._embed_texts, [query])
+
         # 内嵌异步函数：将同步的分层搜索包装为线程执行
         async def search_layer(layer: str) -> tuple[str, list[dict]]:
             results = await asyncio.to_thread(
@@ -660,9 +721,7 @@ class MemoryService:
             return layer, results
 
         # 三层搜索并发执行（asyncio.gather 并行化）
-        pairs = await asyncio.gather(
-            *(search_layer(layer) for layer in MEMORY_LAYERS)
-        )
+        pairs = await asyncio.gather(*(search_layer(layer) for layer in MEMORY_LAYERS))
         layered = dict(pairs)
         # 记录分层搜索追踪事件
         self._trace_event(
@@ -672,9 +731,7 @@ class MemoryService:
                 "query": query,
                 "layer_top_k": limits,
                 "min_score": min_score,
-                "layer_counts": {
-                    layer: len(items) for layer, items in layered.items()
-                },
+                "layer_counts": {layer: len(items) for layer, items in layered.items()},
                 "elapsed_ms": (time.perf_counter() - start) * 1000,
             },
         )
@@ -707,7 +764,7 @@ class MemoryService:
                     f"""
                     UPDATE memories
                     SET deleted_at = ?, updated_at = ?
-                    WHERE {' AND '.join(where)}
+                    WHERE {" AND ".join(where)}
                     """,
                     [utc_now(), utc_now(), *params],
                 )
@@ -718,6 +775,7 @@ class MemoryService:
             # 重建受影响用户的FAISS索引以排除已删除记录
             for affected_user_id in affected_user_ids:
                 self._rebuild_user_index(affected_user_id)
+                self._invalidate_version_cache(affected_user_id)
             return True
 
     def clear_user_memory(self, user_id: str) -> int:
@@ -745,6 +803,7 @@ class MemoryService:
             # 如果有记录被删除，重建该用户的FAISS索引
             if cursor.rowcount > 0:
                 self._rebuild_user_index(user_id)
+                self._invalidate_version_cache(user_id)
             return int(cursor.rowcount)
 
     def close(self) -> None:
@@ -830,31 +889,9 @@ class MemoryService:
             "memory_version": self._memory_cache_version(user_id),  # 记忆变更使缓存失效
         }
 
-    def _read_cached_memory_results(
-        self,
-        payload: dict[str, Any],
-    ) -> list[dict] | None:
-        """尝试从缓存中读取记忆搜索结果。
-        返回 None 表示缓存未命中（不存在或已过期）。"""
-        key = cache_key_or_none(self.cache, "memory_search", payload)
-        if key is None:
-            return None
-        cached = self.cache.get_json(key)
-        # 验证缓存数据类型：必须是列表
-        if not isinstance(cached, list):
-            return None
-        return [dict(item) for item in cached if isinstance(item, dict)]
-
-    def _write_cached_memory_results(
-        self,
-        payload: dict[str, Any],
-        results: list[dict],
-    ) -> None:
-        """将搜索结果写入缓存，使用配置的TTL（memory_ttl_s）作为过期时间。"""
-        key = cache_key_or_none(self.cache, "memory_search", payload)
-        if key is None:
-            return
-        self.cache.set_json(key, results, ttl_s=self.cache_ttls.memory_ttl_s)
+    def _invalidate_version_cache(self, user_id: str) -> None:
+        """使特定用户的缓存版本号失效（在写操作后调用）。"""
+        self._version_cache.pop(user_id, None)
 
     def _memory_cache_version(self, user_id: str) -> str:
         """生成用户记忆的缓存版本号。
@@ -862,7 +899,13 @@ class MemoryService:
         通过统计该用户的总记录数、活跃记录数、最后更新时间、最后删除时间
         来生成一个稳定摘要。当任何记忆被添加、修改或删除时，摘要会变化，
         从而使所有相关缓存自动失效。
+
+        缓存版本号在 5 秒内复用，避免频繁的聚合 SQL 查询。
         """
+        now = time.time()
+        cached = self._version_cache.get(user_id)
+        if cached is not None and now - cached[1] < self._version_cache_ttl:
+            return cached[0]
         with self._lock:
             row = self.conn.execute(
                 """
@@ -883,7 +926,7 @@ class MemoryService:
                 [utc_now(), user_id],
             ).fetchone()
         # 通过哈希摘要生成稳定的缓存版本字符串
-        return stable_cache_digest(
+        version = stable_cache_digest(
             {
                 "total_count": int(row["total_count"] or 0),
                 "active_count": int(row["active_count"] or 0),
@@ -891,6 +934,8 @@ class MemoryService:
                 "max_deleted_at": row["max_deleted_at"],
             }
         )
+        self._version_cache[user_id] = (version, now)
+        return version
 
     def _init_db(self) -> None:
         """初始化SQLite数据库：创建memories表和索引（如果不存在）。
@@ -909,11 +954,10 @@ class MemoryService:
 
         索引 idx_memories_user_active: 加速按用户查询活跃记忆（最常见查询模式）
         """
-        with self._lock:
-            with self.conn:
-                # 创建memories表（IF NOT EXISTS保证幂等性）
-                self.conn.execute(
-                    """
+        with self._lock, self.conn:
+            # 创建memories表（IF NOT EXISTS保证幂等性）
+            self.conn.execute(
+                """
                     CREATE TABLE IF NOT EXISTS memories (
                         id TEXT PRIMARY KEY,
                         user_id TEXT NOT NULL,
@@ -928,14 +972,14 @@ class MemoryService:
                         deleted_at TEXT
                     )
                     """
-                )
-                # 创建复合索引：加速 "查询某用户的活跃记忆" 这一核心操作
-                self.conn.execute(
-                    """
+            )
+            # 创建复合索引：加速 "查询某用户的活跃记忆" 这一核心操作
+            self.conn.execute(
+                """
                     CREATE INDEX IF NOT EXISTS idx_memories_user_active
                     ON memories(user_id, deleted_at, updated_at)
                     """
-                )
+            )
 
     def _ensure_embedding_config(self) -> None:
         """验证并确保Embedding配置的一致性。
@@ -955,10 +999,10 @@ class MemoryService:
             return
 
         # 配置已变更：清除所有重建资源
-        self._index_cache.clear()                     # 清空内存缓存
-        for path in self.index_dir.glob("*.faiss"):   # 删除所有FAISS索引文件
+        self._index_cache.clear()  # 清空内存缓存
+        for path in self.index_dir.glob("*.faiss"):  # 删除所有FAISS索引文件
             path.unlink()
-        for path in self.index_dir.glob("*.ids.json"): # 删除所有ID映射文件
+        for path in self.index_dir.glob("*.ids.json"):  # 删除所有ID映射文件
             path.unlink()
         # 写入新的配置快照
         self.embedding_config_path.write_text(
@@ -1035,7 +1079,7 @@ class MemoryService:
         return [str(row["user_id"]) for row in rows]
 
     def _user_index_paths(self, user_id: str) -> tuple[Path, Path]:
-        """为用户生成FAISS索引文件和ID映射文件的路径。
+        r"""为用户生成FAISS索引文件和ID映射文件的路径。
 
         使用SHA256哈希处理user_id，避免文件名中包含特殊字符（如/、\等）。
         返回: (faiss_index_path, ids_json_path)
@@ -1043,8 +1087,8 @@ class MemoryService:
         # SHA256哈希确保文件名安全且唯一
         user_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
         return (
-            self.index_dir / f"{user_hash}.faiss",   # FAISS二进制索引
-            self.index_dir / f"{user_hash}.ids.json", # 索引向量对应的memory_id列表
+            self.index_dir / f"{user_hash}.faiss",  # FAISS二进制索引
+            self.index_dir / f"{user_hash}.ids.json",  # 索引向量对应的memory_id列表
         )
 
     def _get_user_index(self, user_id: str) -> tuple[faiss.Index | None, list[str]]:
@@ -1186,14 +1230,14 @@ class MemoryService:
             if isinstance(cached, list) and cached:
                 cached_vectors[index] = [float(item) for item in cached]  # 缓存命中
             else:
-                missing_texts.append(text)      # 缓存未命中，需要调用API
+                missing_texts.append(text)  # 缓存未命中，需要调用API
                 missing_indices.append(index)
 
         # 第二阶段：批量调用API向量化所有缺失文本
         if missing_texts:
             vectors = self.embeddings.embed_documents(missing_texts)
             # 将API返回的向量填入cached_vectors对应位置
-            for index, vector in zip(missing_indices, vectors, strict=False):
+            for index, vector in zip(missing_indices, vectors, strict=True):
                 cached_vectors[index] = [float(item) for item in vector]
 
         # 第三阶段：构建numpy矩阵并L2归一化
@@ -1230,14 +1274,6 @@ class MemoryService:
             },
         )
 
-    def _normalize_vector_score(self, score: float) -> float:
-        """将FAISS内积原始分数归一化到 [0.0, 1.0] 区间。
-
-        FAISS内积分数范围一般在 [-1, 1]（L2归一化后），
-        通过 (score+1)/2 线性映射到 [0, 1]，并夹紧确保合法性。
-        """
-        return max(0.0, min(1.0, (score + 1) / 2))
-
     def _normalize_memory_types(
         self,
         memory_types: set[str] | list[str] | tuple[str, ...] | None,
@@ -1247,17 +1283,13 @@ class MemoryService:
         if memory_types is None:
             return None  # None语义：不做类型过滤
         # 只保留合法的记忆类型，去掉未知类型
-        return {
-            str(item)
-            for item in memory_types
-            if str(item) in MEMORY_TYPES
-        }
+        return {str(item) for item in memory_types if str(item) in MEMORY_TYPES}
 
     def _is_expired(self, row: sqlite3.Row) -> bool:
         """检查一条记忆记录是否已过期。
         expires_at 为 NULL 表示永不过期，否则比较过期时间与当前时间。"""
         expires_at = row["expires_at"]
-        return bool(expires_at and str(expires_at) <= utc_now())
+        return bool(expires_at and datetime.fromisoformat(str(expires_at)) <= datetime.now(UTC))
 
     def _row_to_record(self, row: sqlite3.Row) -> dict:
         """将SQLite行对象转换为标准的字典格式。
@@ -1301,6 +1333,7 @@ class ExtractedMemory:
         importance:  重要性分数 [0.0, 1.0]，影响后续检索排序
         expires_at:  可选过期时间，None表示永不过期
     """
+
     content: str
     memory_type: str
     importance: float
@@ -1328,7 +1361,7 @@ class LLMMemoryExtractor:
         model_kwargs: dict[str, Any] | None = None,
         model: Any | None = None,
         retry_policy: LLMRetryPolicy | None = None,
-        trace_recorder: Any | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         """初始化LLM记忆抽取器。
 
@@ -1353,9 +1386,7 @@ class LLMMemoryExtractor:
         self.trace_recorder = trace_recorder
         # 系统提示词：指导LLM如何从对话中抽取记忆
         # 包含详细的抽取规则、记忆类型说明、输出格式要求和隐私保护指令
-        self.system_prompt = SystemMessage(
-            content=load_prompt("memory_extractor_system.txt")
-        )
+        self.system_prompt = SystemMessage(content=load_prompt("memory_extractor_system.txt"))
 
     def extract(
         self,
@@ -1411,12 +1442,8 @@ class LLMMemoryExtractor:
             existing_block=existing_block,
         )
 
-        # 内嵌异步函数：优先使用异步接口，否则在线程中执行同步调用
         async def invoke_model() -> Any:
-            if hasattr(self.model, "ainvoke"):
-                return await self.model.ainvoke(messages)
-            # 模型不支持异步接口：在线程中同步调用以避免阻塞事件循环
-            return await asyncio.to_thread(self.model.invoke, messages)
+            return await call_async_fallback(self.model, "ainvoke", "invoke", messages)
 
         # 异步调用LLM，失败时自动重试
         response = await ainvoke_with_retry(
@@ -1457,15 +1484,14 @@ class LLMMemoryExtractor:
         ]
 
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
-        """记录LLM调用的重试事件到追踪系统。
-        will_retry=True时记录为warning级别，否则为error级别。"""
-        if self.trace_recorder is None:
-            return
-        self.trace_recorder.event(
+        """记录LLM调用的重试事件到追踪系统。"""
+        trace_retry_failure(
+            self.trace_recorder,
             "model",
             "memory_extractor.model_retry",
-            {"provider": self.provider, "model_name": self.model_name, **event},
-            level="warning" if event.get("will_retry") else "error",
+            self.provider,
+            self.model_name,
+            event,
         )
 
     def _format_existing_memories(self, memories: list[dict]) -> str:

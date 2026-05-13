@@ -18,6 +18,7 @@ from langchain_core.messages import (
 from rag_server.cli import (
     CLICompleter,
     CLIInputSession,
+    CLIStatusEventSink,
     CLIStyle,
     CLIThinkingIndicator,
     CLIView,
@@ -25,9 +26,8 @@ from rag_server.cli import (
     PromptToolkitSlashCompleter,
     available_slash_command_specs,
     build_agent,
-    format_cli_live_event,
-    CLIStatusEventSink,
     build_retrieval_tool_with_rewrite,
+    format_cli_live_event,
     handle_shortcuts_command,
     handle_unknown_slash_command,
     is_cli_clear_command,
@@ -48,6 +48,7 @@ class FakeStreamingApp:
 
 class FakeHistoryInspectingApp:
     """模拟的 Agent 应用，记录每次调用时的历史消息长度，用于验证 clear 命令是否清空了上下文。"""
+
     def __init__(self) -> None:
         self.history_lengths: list[int] = []
 
@@ -61,10 +62,7 @@ class FakeToolStreamingApp:
     """模拟先工具调用再生成最终回答的流式 Agent，验证多轮工具调用历史被正确保留。"""
 
     async def astream(self, state, stream_mode):
-        has_prior_tool_result = any(
-            isinstance(message, ToolMessage)
-            for message in state.get("messages", [])
-        )
+        has_prior_tool_result = any(isinstance(message, ToolMessage) for message in state.get("messages", []))
         if has_prior_tool_result:
             yield {"agent": {"messages": [AIMessage(content="第二轮历史正常")]}}
             yield {"save_memory": None}
@@ -115,9 +113,7 @@ class FakeSinkThenErrorApp:
         # async generator, which `async for` requires.
         if False:  # pragma: no cover
             yield {}
-        raise ValueError(
-            'The "function.arguments" parameter of the code model must be in JSON format.'
-        )
+        raise ValueError('The "function.arguments" parameter of the code model must be in JSON format.')
 
 
 class SyncOnlyRAG:
@@ -152,12 +148,11 @@ class FakeStreamingModel:
 
 class FakeStreamingThenErrorModel(FakeStreamingModel):
     """模拟流式输出完毕后抛出异常的模型，验证已输出的内容是否被保留。"""
+
     async def astream(self, messages, **kwargs):
         yield AIMessageChunk(content="分段")
         yield AIMessageChunk(content="回答")
-        raise ValueError(
-            'The "function.arguments" parameter of the code model must be in JSON format.'
-        )
+        raise ValueError('The "function.arguments" parameter of the code model must be in JSON format.')
 
 
 class FakeStreamingConnectionDropModel(FakeStreamingModel):
@@ -173,6 +168,7 @@ class FakeStreamingConnectionDropModel(FakeStreamingModel):
 
 class FakePydanticStyleStreamingModel(FakeStreamingModel):
     """支持 model_copy 的假流式模型，用于测试 model_with_streaming_enabled 使用 model_copy 创建副本。"""
+
     def model_copy(self, *, update):
         clone = FakePydanticStyleStreamingModel()
         for key, value in update.items():
@@ -230,9 +226,7 @@ class FakePrefaceThenToolErrorModel:
                 }
             ],
         )
-        raise ValueError(
-            'The "function.arguments" parameter of the code model must be in JSON format.'
-        )
+        raise ValueError('The "function.arguments" parameter of the code model must be in JSON format.')
 
     async def ainvoke(self, messages):
         return AIMessage(content="兜底回答")
@@ -292,15 +286,13 @@ class FakeBadSkillToolArgsModel:
                 ],
             )
         has_loaded_skill = any(
-            isinstance(message, ToolMessage)
-            and "Skill loaded: sizing-advice" in str(message.content)
+            isinstance(message, ToolMessage) and "Skill loaded: sizing-advice" in str(message.content)
             for message in messages
         )
         if has_loaded_skill:
             return AIMessage(content="已按尺码 skill 完成回答。")
         has_missing_path_feedback = any(
-            isinstance(message, ToolMessage)
-            and "read_skill_file 缺少 relative_path" in str(message.content)
+            isinstance(message, ToolMessage) and "read_skill_file 缺少 relative_path" in str(message.content)
             for message in messages
         )
         if has_missing_path_feedback:
@@ -339,9 +331,7 @@ class FakeMissingToolNameModel:
                 ],
             )
         has_tool_feedback = any(
-            isinstance(message, ToolMessage)
-            and "工具调用缺少 name" in str(message.content)
-            for message in messages
+            isinstance(message, ToolMessage) and "工具调用缺少 name" in str(message.content) for message in messages
         )
         if has_tool_feedback:
             return AIMessage(content="已改为直接回答。")
@@ -368,11 +358,9 @@ class FakeSkillRegistry:
 
 class SkillRegistryForBadArgs(FakeSkillRegistry):
     """模拟的 Skill 注册表，额外提供 skill 发现提示和显式调用名称解析，用于测试错误参数修复流程。"""
+
     def discovery_prompt(self):
-        return (
-            "可用 Anthropic-style Skills 如下。\n"
-            "- /sizing-advice: 尺码推荐"
-        )
+        return "可用 Anthropic-style Skills 如下。\n- /sizing-advice: 尺码推荐"
 
     def explicit_invocation_name(self, text):
         return "sizing-advice" if text.strip().startswith("/sizing-advice") else None
@@ -443,6 +431,7 @@ class FakeDocument:
 
 class FakePromptToolkitSession:
     """模拟 prompt_toolkit 的 PromptSession，记录 prompt_async 调用并返回固定回复。"""
+
     def __init__(self) -> None:
         self.calls = []
 
@@ -544,6 +533,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_agent_streams_final_answer_chunks_to_sink(self) -> None:
         """验证 Agent 流式输出的每个 chunk 都通过 output_delta_sink 发送，最终回答和流式内容一致。"""
+
         async def run_case() -> tuple[str, str]:
             deltas: list[str] = []
             app, _, _ = build_agent(
@@ -582,6 +572,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_agent_streaming_preserves_tool_calls_before_final_answer(self) -> None:
         """验证 Agent 在工具调用之后继续流式输出最终回答，且最终回答正确到达 sink。"""
+
         async def run_case() -> tuple[str, str]:
             deltas: list[str] = []
             app, _, _ = build_agent(
@@ -610,6 +601,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_agent_streams_preface_before_tool_call_and_keeps_it(self) -> None:
         """验证前置引导文本（如"我先查一下"）在工具调用前已被发送到 sink 并保留显示，即使后续抛出异常。"""
+
         async def run_case() -> list[str]:
             deltas: list[str] = []
             app, _, _ = build_agent(
@@ -639,6 +631,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_agent_streams_preface_and_final_answer_through_tool_loop(self) -> None:
         """验证完整工具调用链路中前置引导文本和最终回答都被保留在流式输出中。"""
+
         async def run_case() -> tuple[str, str]:
             deltas: list[str] = []
             app, _, _ = build_agent(
@@ -668,6 +661,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_missing_skill_file_path_feedback_is_returned_to_model_for_repair(self) -> None:
         """验证当模型调用 read_skill_file 缺少 relative_path 时，系统将错误反馈返回给模型，模型自动修正为 load_skill 调用。"""
+
         async def run_case() -> tuple[str, list[ToolMessage]]:
             app, _, _ = build_agent(
                 SyncOnlyRAG(),
@@ -686,23 +680,18 @@ class CLIRuntimeTests(unittest.TestCase):
                     "user_id": "user",
                 }
             )
-            tool_messages = [
-                message
-                for message in result["messages"]
-                if isinstance(message, ToolMessage)
-            ]
+            tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
             return result["messages"][-1].content, tool_messages
 
         final, tool_messages = asyncio.run(run_case())
 
         self.assertEqual(final, "已按尺码 skill 完成回答。")
-        self.assertTrue(
-            any("read_skill_file 缺少 relative_path" in str(item.content) for item in tool_messages)
-        )
+        self.assertTrue(any("read_skill_file 缺少 relative_path" in str(item.content) for item in tool_messages))
         self.assertTrue(any("Skill loaded: sizing-advice" in str(item.content) for item in tool_messages))
 
     def test_missing_tool_call_name_is_returned_to_model_for_repair(self) -> None:
         """验证当模型发出的工具调用缺少 name 字段时，系统将错误反馈返回给模型，模型改为直接回答。"""
+
         async def run_case() -> tuple[str, list[ToolMessage]]:
             app, _, _ = build_agent(
                 SyncOnlyRAG(),
@@ -720,11 +709,7 @@ class CLIRuntimeTests(unittest.TestCase):
                     "user_id": "user",
                 }
             )
-            tool_messages = [
-                message
-                for message in result["messages"]
-                if isinstance(message, ToolMessage)
-            ]
+            tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
             return result["messages"][-1].content, tool_messages
 
         final, tool_messages = asyncio.run(run_case())
@@ -734,10 +719,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_slash_command_specs_include_builtin_and_skills(self) -> None:
         """验证 available_slash_command_specs 返回的列表中同时包含内置命令（/memory，/clear）和 skill 命令。"""
-        commands = [
-            item.command
-            for item in available_slash_command_specs(FakeSkillRegistry())
-        ]
+        commands = [item.command for item in available_slash_command_specs(FakeSkillRegistry())]
 
         self.assertIn("/memory", commands)
         self.assertIn("/clear", commands)
@@ -774,9 +756,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_prompt_toolkit_completer_returns_live_menu_items(self) -> None:
         """验证 PromptToolkitSlashCompleter 同步补全能根据前缀返回匹配项和正确的 start_position。"""
-        completer = PromptToolkitSlashCompleter(
-            available_slash_command_specs(FakeSkillRegistry())
-        )
+        completer = PromptToolkitSlashCompleter(available_slash_command_specs(FakeSkillRegistry()))
 
         completions = list(completer.get_completions(FakeDocument("/mem"), None))
 
@@ -785,10 +765,9 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_prompt_toolkit_completer_supports_async_completion(self) -> None:
         """验证 PromptToolkitSlashCompleter 支持异步补全接口 get_completions_async。"""
+
         async def collect_completions():
-            completer = PromptToolkitSlashCompleter(
-                available_slash_command_specs(FakeSkillRegistry())
-            )
+            completer = PromptToolkitSlashCompleter(available_slash_command_specs(FakeSkillRegistry()))
             return [
                 item
                 async for item in completer.get_completions_async(
@@ -849,6 +828,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_thinking_indicator_animates_and_clears_on_tty(self) -> None:
         """验证思考状态指示器在 TTY 下正确显示动画（含动画帧、颜色 ANSI 码），并在停止时用 \\r\\033[K 清除行。"""
+
         async def run_case() -> str:
             stream = io.StringIO()
             stream.isatty = lambda: True
@@ -913,7 +893,7 @@ class CLIRuntimeTests(unittest.TestCase):
         readline.buffer = "hello /rem"
         readline.begin = 6
 
-        with patch("rag_server.cli._readline", readline):
+        with patch("rag_server.cli_view._readline", readline):
             self.assertIsNone(completer.complete("/rem", 0))
 
     def test_unknown_slash_command_prints_suggestions(self) -> None:
@@ -1073,7 +1053,7 @@ class CLIRuntimeTests(unittest.TestCase):
         self.assertNotIn("function.arguments", output)
 
     def test_cli_falls_back_to_invoke_when_stream_connection_drops(self) -> None:
-        """验证流式传输中连接断开时，CLI 回退到 ainvoke 普通调用获取完整回答，且先清除不完整的流式输出。"""
+        """验证流式传输中连接断开时，CLI 复用已收到的 chunks 而非回退到 ainvoke 二次调用。"""
         inputs = iter(["你好", "exit"])
 
         with (
@@ -1102,8 +1082,8 @@ class CLIRuntimeTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Assistant\n", output)
         self.assertIn("半截", output)
-        self.assertIn("\r\x1b[K", output)
-        self.assertIn("普通调用完整回答", output)
+        # 优化后：已有内容时不清屏不回退，直接使用已接收的 chunks
+        self.assertNotIn("普通调用完整回答", output)
         self.assertNotIn("ConnectionError", output)
         self.assertNotIn("大模型调用失败", output)
 
@@ -1232,6 +1212,7 @@ class CLIRuntimeTests(unittest.TestCase):
 
     def test_retrieval_tool_falls_back_to_sync_search(self) -> None:
         """验证 retrieval tool 在 query_rewrite 关闭时回退到同步 search 方法，返回结果包含预期的 source 文件路径。"""
+
         async def run_case() -> str:
             tool = build_retrieval_tool_with_rewrite(
                 SyncOnlyRAG(),

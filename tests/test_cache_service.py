@@ -29,8 +29,10 @@ class CacheServiceTests(unittest.TestCase):
         cache.set_json(key, {"value": "cached"}, ttl_s=1)
         self.assertEqual(cache.get_json(key), {"value": "cached"})
 
-        # 等待超过 TTL 后读取，应返回 None
-        time.sleep(1.05)
+        # 等待超过 TTL 后读取，使用 monotonic 确保精确等待
+        deadline = time.monotonic() + 1.1
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
 
         self.assertIsNone(cache.get_json(key))
 

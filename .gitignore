@@ -23,6 +23,4 @@ traces/
 evals/*_report.json
 evals/latest_report.json
 
-CLAUDE.md
-
 dump.rdb

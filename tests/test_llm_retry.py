@@ -173,6 +173,7 @@ class InvokeWithRetryTests(unittest.TestCase):
 
     def test_timeout_enforcement(self) -> None:
         """验证单次调用超时生效：耗时超过 per_attempt_timeout_s 时抛出 LLMRetryError。"""
+
         def slow():
             time.sleep(5)
             return "done"
@@ -187,6 +188,7 @@ class AsyncInvokeWithRetryTests(unittest.TestCase):
 
     def test_async_success(self) -> None:
         """异步调用首次成功，直接返回结果。"""
+
         async def go():
             async def success():
                 return 42

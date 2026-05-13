@@ -13,11 +13,12 @@ from .trace_service import TraceRecorder, summarize_result
 @dataclass(frozen=True)
 class RetrievalEvalCase:
     """单条检索评测用例，包含查询和多种匹配条件。"""
-    id: str                          # 用例唯一标识
-    query: str                       # 评测查询文本
-    expected_sources: list[str]      # 期望命中的文档来源路径列表
-    expected_doc_ids: list[str]      # 期望命中的文档 ID 列表
-    expected_substrings: list[str]   # 期望检索结果内容中出现的子串列表
+
+    id: str  # 用例唯一标识
+    query: str  # 评测查询文本
+    expected_sources: list[str]  # 期望命中的文档来源路径列表
+    expected_doc_ids: list[str]  # 期望命中的文档 ID 列表
+    expected_substrings: list[str]  # 期望检索结果内容中出现的子串列表
 
 
 def load_retrieval_eval_dataset(path: str | Path) -> list[RetrievalEvalCase]:
@@ -29,9 +30,7 @@ def load_retrieval_eval_dataset(path: str | Path) -> list[RetrievalEvalCase]:
     if eval_path.suffix.lower() == ".jsonl":
         # JSONL 格式：每行一个 JSON 对象，跳过空行和注释行（以 # 开头）
         raw_items = [
-            json.loads(line)
-            for line in text.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
+            json.loads(line) for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
         ]
     else:
         # JSON 格式：顶层可以是数组，或者包含 "cases" 键的对象
@@ -54,9 +53,7 @@ def load_retrieval_eval_dataset(path: str | Path) -> list[RetrievalEvalCase]:
                 query=query,
                 expected_sources=_normalize_string_list(item.get("expected_sources")),
                 expected_doc_ids=_normalize_string_list(item.get("expected_doc_ids")),
-                expected_substrings=_normalize_string_list(
-                    item.get("expected_substrings")
-                ),
+                expected_substrings=_normalize_string_list(item.get("expected_substrings")),
             )
         )
     return cases
@@ -100,19 +97,20 @@ def evaluate_retrieval_dataset(
         report = {
             "id": case.id,
             "query": case.query,
-            "hit": match_rank is not None,                      # 是否有综合命中
-            "rank": match_rank,                                  # 综合命中排名（1-based）
+            "hit": match_rank is not None,  # 是否有综合命中
+            "rank": match_rank,  # 综合命中排名（1-based）
             "reciprocal_rank": 0.0 if match_rank is None else 1.0 / match_rank,  # 倒数排名
-            "source_hit": source_rank is not None,               # 是否有来源命中
-            "source_rank": source_rank,                          # 来源命中排名
-            "substring_hit": substring_rank is not None,         # 是否有子串命中
-            "substring_rank": substring_rank,                    # 子串命中排名
-            "expected_sources": case.expected_sources,           # 记录期望条件，便于人工复核
+            "source_hit": source_rank is not None,  # 是否有来源命中
+            "source_rank": source_rank,  # 来源命中排名
+            "substring_hit": substring_rank is not None,  # 是否有子串命中
+            "substring_rank": substring_rank,  # 子串命中排名
+            "expected_sources": case.expected_sources,  # 记录期望条件，便于人工复核
             "expected_doc_ids": case.expected_doc_ids,
             "expected_substrings": case.expected_substrings,
             "results": [
                 # 对每一条检索结果生成摘要（包含内容）
-                summarize_result(item, include_content=True) for item in results
+                summarize_result(item, include_content=True)
+                for item in results
             ],
         }
         case_reports.append(report)
@@ -229,10 +227,7 @@ def _matches_source(case: RetrievalEvalCase, item: dict) -> bool:
 
     # 规范化路径斜杠后，检查来源路径的后缀是否匹配（支持相对路径匹配）
     source = _normalize_path_string(str(item.get("source") or ""))
-    return any(
-        source.endswith(_normalize_path_string(expected_source))
-        for expected_source in case.expected_sources
-    )
+    return any(source.endswith(_normalize_path_string(expected_source)) for expected_source in case.expected_sources)
 
 
 def _matches_substring(case: RetrievalEvalCase, item: dict) -> bool:
@@ -264,11 +259,7 @@ def _summarize_cases(case_reports: list[dict]) -> dict:
         # mrr (Mean Reciprocal Rank): 各用例倒数排名的平均值
         "mrr": sum(float(item["reciprocal_rank"]) for item in case_reports) / count,
         # source_hit_rate: 来源命中用例数 / 总用例数
-        "source_hit_rate": (
-            sum(1 for item in case_reports if item["source_hit"]) / count
-        ),
+        "source_hit_rate": (sum(1 for item in case_reports if item["source_hit"]) / count),
         # substring_hit_rate: 子串命中用例数 / 总用例数
-        "substring_hit_rate": (
-            sum(1 for item in case_reports if item["substring_hit"]) / count
-        ),
+        "substring_hit_rate": (sum(1 for item in case_reports if item["substring_hit"]) / count),
     }

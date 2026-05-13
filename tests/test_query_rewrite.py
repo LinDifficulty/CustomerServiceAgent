@@ -18,17 +18,19 @@ from typing import Any
 from rag_server.cache_service import InMemoryJsonCache
 from rag_server.query_rewrite import LLMQueryRewriter, QueryRewriteResult
 
-
 # --- 测试用 Fake 模型 ---
+
 
 class FakeRewriteModel:
     """参数化假模型：返回指定的 content 作为 LLM 响应。"""
+
     def __init__(self, content: Any) -> None:
         self._content = content
 
     def invoke(self, messages: Any) -> Any:
         class Response:
             content = self._content
+
         return Response()
 
 
@@ -40,12 +42,9 @@ VALID_REWRITE_JSON = (
 )
 EMPTY_REWRITE_JSON = '{"rewritten_query":"","search_queries":[],"notes":[]}'
 WRAPPED_JSON = (
-    "以下是改写结果：\n"
-    '```json\n{"rewritten_query":"改写后的查询","search_queries":["查询1"],"notes":[]}\n```'
+    '以下是改写结果：\n```json\n{"rewritten_query":"改写后的查询","search_queries":["查询1"],"notes":[]}\n```'
 )
-MULTI_PART_CONTENT = [
-    {"text": '{"rewritten_query":"多段内容","search_queries":["q1"],"notes":[]}'}
-]
+MULTI_PART_CONTENT = [{"text": '{"rewritten_query":"多段内容","search_queries":["q1"],"notes":[]}'}]
 
 
 class LLMQueryRewriterTests(unittest.TestCase):
@@ -64,6 +63,7 @@ class LLMQueryRewriterTests(unittest.TestCase):
 
     def test_arewrite_returns_structured_result(self) -> None:
         """验证异步改写同样返回正确的 QueryRewriteResult 结构。"""
+
         async def run_case() -> QueryRewriteResult:
             rewriter = LLMQueryRewriter(model=FakeRewriteModel(VALID_REWRITE_JSON))
             return await rewriter.arewrite("160cm 95斤穿什么码？")
@@ -99,8 +99,7 @@ class LLMQueryRewriterTests(unittest.TestCase):
     def test_search_queries_deduplication(self) -> None:
         """验证搜索查询列表中的重复项被去重，保持原有顺序。"""
         dup_content = (
-            '{"rewritten_query":"同一个查询",'
-            '"search_queries":["同一个查询","不同查询","同一个查询"],"notes":[]}'
+            '{"rewritten_query":"同一个查询","search_queries":["同一个查询","不同查询","同一个查询"],"notes":[]}'
         )
         rewriter = LLMQueryRewriter(model=FakeRewriteModel(dup_content))
         result = rewriter.rewrite("原始")
@@ -110,10 +109,7 @@ class LLMQueryRewriterTests(unittest.TestCase):
 
     def test_search_queries_capped_at_three(self) -> None:
         """验证搜索查询数量上限为 3 条，超过部分被截断。"""
-        many_content = (
-            '{"rewritten_query":"改写",'
-            '"search_queries":["q1","q2","q3","q4","q5"],"notes":[]}'
-        )
+        many_content = '{"rewritten_query":"改写","search_queries":["q1","q2","q3","q4","q5"],"notes":[]}'
         rewriter = LLMQueryRewriter(model=FakeRewriteModel(many_content))
         result = rewriter.rewrite("原始")
 
@@ -121,13 +117,11 @@ class LLMQueryRewriterTests(unittest.TestCase):
 
     def test_rewrite_uses_cache_for_repeated_query(self) -> None:
         """验证重复查询命中缓存，LLM 模型仅被调用一次。"""
-        cache_content = (
-            '{"rewritten_query":"缓存查询",'
-            '"search_queries":["缓存查询"],"notes":[]}'
-        )
+        cache_content = '{"rewritten_query":"缓存查询","search_queries":["缓存查询"],"notes":[]}'
 
         class CountingModel(FakeRewriteModel):
             calls = 0
+
             def invoke(self, messages: Any) -> Any:
                 self.calls += 1
                 return super().invoke(messages)

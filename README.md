@@ -1,8 +1,8 @@
-# Tulip Agent
+# RAG Server
 
-本地可复用的中文 RAG / 智能体组件库，当前面向电商客服知识库场景。
+本地可复用的中文 RAG / 智能体组件库，当前面向电商客服知识库场景。CLI 智能体展示名称为 **Tulip Agent**。
 
-它不是 HTTP 接口服务，而是一组 Python 组件和一个 CLI 智能体：把 `docs/` 下的文档写入 `data/`，用 FAISS 多向量检索、BM25、可选 CrossEncoder 精排完成知识库召回，再按需叠加查询改写、长期记忆、技能、MCP 工具、追踪和评测。
+它不是 HTTP 接口服务，而是一组 Python 组件和一个 CLI 智能体：把 `docs/` 下的文档写入 `data/`，用 FAISS 多向量检索、BM25、可选 CrossEncoder 精排完成知识库召回，再按需叠加查询改写、长期记忆、Skills、MCP 工具、Redis 缓存、链路追踪和检索评测。
 
 更完整的实现说明见 [项目技术文档.md](./项目技术文档.md)。
 
@@ -16,15 +16,11 @@ uv run python examples/ingest_documents.py
 uv run rag-cli
 ```
 
-退出 CLI 时输入 `quit` 或 `exit`。兼容入口仍可用：
-
-```bash
-uv run python main.py
-```
+退出 CLI 时输入 `quit` 或 `exit`。
 
 默认模型配置：
 
-- 聊天 / 智能体模型：`tongyi` + `qwen3-max-2026-01-23`
+- 聊天 / 智能体模型：`tongyi` + `deepseek-v4-flash`
 - 向量模型：`dashscope` + `text-embedding-v4`
 - 精排模型：`cross_encoder` + `BAAI/bge-reranker-v2-m3`，默认关闭
 
@@ -41,15 +37,17 @@ uv run python main.py
 
 ## 核心能力
 
-- `RAGService`：文档入库、FAISS 多向量召回、BM25、混合检索、可选精排
-- `rag-cli`：基于 LangGraph 的命令行客服智能体
+- `RAGService`：文档入库、FAISS 多向量召回（summary/keyword/semantic）、BM25、混合检索、可选精排
+- `rag-cli`：基于 LangGraph 的命令行客服智能体（Tulip Agent），支持流式输出与思考状态展示
 - `LLMQueryRewriter`：查询改写和多查询融合检索
-- `MemoryService`：按 `user_id` 隔离的长期记忆
+- `MemoryService`：按 `user_id` 隔离的长期记忆（profile/episode/procedure 三层）
 - `SkillRegistry`：Anthropic 风格 `SKILL.md` 技能加载
 - `MCP Client`：把 MCP 服务器工具接成 LangChain 工具
-- `JsonCache`：Redis / 内存缓存，加速重复查询
-- `TraceRecorder`：JSONL 链路追踪
+- `JsonCache`：Redis / 内存缓存，加速重复查询，连接失败自动降级
+- `TraceRecorder`：JSONL 链路追踪，支持实时事件打印
 - `eval_runner`：检索评测和指标输出
+- `LLMRetryPolicy`：LLM 调用统一重试与退避
+- `ReflectionService`：回答后事实审校与修正
 
 支持文档格式：`.txt`、`.md`、`.pdf`。PDF 使用 `pypdf` 抽取文本，不包含 OCR。
 
@@ -146,6 +144,8 @@ uv run rag-cli --redis-url redis://localhost:6379/0
 
 CLI 内置命令：
 
+- `/help`：显示快捷帮助和可用命令列表
+- `/clear`：清空当前会话上下文
 - `/memory`：查看当前用户长期记忆
 - `/remember 内容`：写入长期偏好或指令
 - `/remember-episode 内容`：写入历史事件
@@ -183,6 +183,8 @@ CLI 配置合并顺序：
 - 重排序模型：`cross_encoder`
 
 使用 `openai` provider 需要额外安装 `langchain-openai`。
+
+CLI 交互式输入支持 Tab 补全（`readline`）或增强的实时补全菜单（`prompt-toolkit`，可选依赖）。
 
 ## 扩展能力
 
@@ -257,24 +259,59 @@ uv run python -m rag_server.eval_runner \
 ```text
 .
 ├── rag_server/              # 核心组件
-├── docs/                    # 示例知识库
-├── data/                    # 本地索引与元数据
-├── evals/                   # 检索评测数据
+│   ├── cli.py               #   LangGraph Agent 编排、工具定义、节点工厂
+│   ├── cli_view.py          #   CLI 展示层：样式、实时事件、斜杠命令、输入补全
+│   ├── rag_service.py       #   文档入库、FAISS多向量、BM25、混合检索、精排
+│   ├── config.py            #   四层优先级配置加载与校验
+│   ├── model_factory.py     #   模型 provider 工厂
+│   ├── memory_service.py    #   SQLite + FAISS 长期记忆
+│   ├── skill_service.py     #   Anthropic 风格 Skills
+│   ├── mcp_service.py       #   MCP 客户端配置与工具加载
+│   ├── cache_service.py     #   Redis / 内存缓存服务
+│   ├── trace_service.py     #   JSONL 链路追踪与事件总线
+│   ├── query_rewrite.py     #   LLM 查询改写与多查询融合检索
+│   ├── reflection_service.py #  回答后事实审校与修正
+│   ├── eval_service.py      #   检索评测核心逻辑
+│   ├── eval_runner.py       #   检索评测 CLI
+│   ├── llm_retry.py         #   LLM 统一重试与退避
+│   ├── utils.py             #   通用工具函数
+│   └── __init__.py          #   公开 API 导出
+├── docs/                    # 示例知识库文档
+├── data/                    # 本地索引与元数据（FAISS、metadata.json、documents.json）
+├── evals/                   # 检索评测数据集
 ├── prompts/                 # 系统提示词模板
-├── examples/                # 示例脚本
+├── examples/                # 示例脚本（入库等）
 ├── tests/                   # 单元测试
-├── main.py                  # 兼容 CLI 入口
+├── .github/                 # CI 工作流（GitHub Actions）
+├── .claude/                 # Claude Code 项目配置与 Skills
+├── CLAUDE.md                # Claude Code 项目指令
+├── LICENSE                  # MIT 许可证
+├── config.example.toml      # 配置文件模板
 ├── mcp_servers.json         # MCP 配置（默认空）
 ├── mcp_servers.example.json # MCP 配置模板
-├── pyproject.toml
-└── 项目技术文档.md
+├── pyproject.toml           # 包元信息、依赖、脚本入口
+├── uv.lock                  # uv 锁定依赖
+├── .pre-commit-config.yaml  # pre-commit 钩子
+└── 项目技术文档.md           # 详细技术文档
 ```
 
 ## 开发与测试
 
 ```bash
-uv run python -m unittest discover -s tests -v
+# 运行所有测试
+uv run python -m pytest tests/ -v
+
+# 运行单个测试文件
+uv run python -m unittest tests/test_rag_service.py
+
+# 运行单个测试用例
+uv run python -m unittest tests.test_rag_service.RAGServiceLifecycleTest.test_add_documents_is_idempotent_and_updates_changed_source
+
+# 代码检查
+uv run ruff check rag_server/ tests/
 ```
+
+CI 通过 GitHub Actions 自动运行；提交前通过 `pre-commit` 钩子做格式化和基础检查。
 
 运行期产物主要包括：
 
@@ -290,3 +327,4 @@ uv run python -m unittest discover -s tests -v
 - 本地索引和记忆更适合单机、单写入者场景
 - 异步入口主要优化单进程内并发，不提供多进程写入保护
 - CrossEncoder 默认关闭，首次开启会下载较大的模型权重
+- PDF 不支持 OCR，只做文本抽取

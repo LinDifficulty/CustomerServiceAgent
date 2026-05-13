@@ -26,8 +26,8 @@ from rag_server.memory_service import (
     memory_layer_for_type,
 )
 
-
 # --- 测试用 Fake 对象 ---
+
 
 class FakeEmbeddings:
     """模拟嵌入模型：根据文本关键词返回确定性向量。"""
@@ -65,6 +65,7 @@ class FakeModel:
     def invoke(self, messages: Any) -> Any:
         class Response:
             content = '{"memories":[]}'
+
         return Response()
 
 
@@ -162,6 +163,7 @@ class MemoryServiceTests(unittest.TestCase):
 
     def test_asearch_memory_layers(self) -> None:
         """测试异步分层搜索，与同步版本结果一致。"""
+
         async def run_case() -> dict[str, list[dict]]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 ms = MemoryService(data_dir=temp_dir, embeddings=FakeEmbeddings())
@@ -288,6 +290,7 @@ class LLMMemoryExtractorTests(unittest.TestCase):
 
     def test_aextract_returns_empty_list_for_no_memories(self) -> None:
         """当 LLM 返回空记忆列表时，异步 aextract 也返回空列表。"""
+
         async def run_case() -> list[ExtractedMemory]:
             extractor = LLMMemoryExtractor(model=FakeModel())
             return await extractor.aextract(
@@ -301,6 +304,7 @@ class LLMMemoryExtractorTests(unittest.TestCase):
 
     def test_extract_parses_valid_memories(self) -> None:
         """验证 LLM 返回的有效 JSON 记忆能正确解析为 ExtractedMemory 对象。"""
+
         class MemoryModel:
             def invoke(self, messages: Any) -> Any:
                 class R:
@@ -308,6 +312,7 @@ class LLMMemoryExtractorTests(unittest.TestCase):
                         '{"memories":[{"content":"用户身高175cm","memory_type":"profile",'
                         '"importance":0.9,"expires_at":null}]}'
                     )
+
                 return R()
 
         extractor = LLMMemoryExtractor(model=MemoryModel())

@@ -13,10 +13,10 @@ from pathlib import Path
 
 from rag_server.skill_service import (
     SkillRegistry,
-    build_skill_tools,
     _parse_frontmatter,
     _safe_child_path,
     _validate_skill_metadata,
+    build_skill_tools,
 )
 
 
@@ -237,15 +237,13 @@ class SafeChildPathTests(unittest.TestCase):
 
     # 验证路径穿越攻击（如 ../../etc/passwd）抛出 ValueError
     def test_traversal_raises(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaises(ValueError):
-                _safe_child_path(Path(temp_dir), "../../etc/passwd")
+        with tempfile.TemporaryDirectory() as temp_dir, self.assertRaises(ValueError):
+            _safe_child_path(Path(temp_dir), "../../etc/passwd")
 
     # 验证空路径参数抛出 ValueError
     def test_empty_path_raises(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaises(ValueError):
-                _safe_child_path(Path(temp_dir), "")
+        with tempfile.TemporaryDirectory() as temp_dir, self.assertRaises(ValueError):
+            _safe_child_path(Path(temp_dir), "")
 
 
 if __name__ == "__main__":

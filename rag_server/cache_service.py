@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import collections
 import json
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from hashlib import sha256
 from typing import Any
+
+from .utils import cache_key_or_none
 
 # 缓存键的 schema 版本号，便于未来升级缓存格式
 CACHE_SCHEMA_VERSION = "v1"
@@ -33,10 +36,10 @@ def stable_json_dumps(value: Any) -> str:
     """
     return json.dumps(
         value,
-        ensure_ascii=False,       # 保留中文字符，避免转义
-        sort_keys=True,           # 按 key 排序，保证输出稳定
-        separators=(",", ":"),    # 紧凑分隔符，消除空格差异
-        default=_json_default,    # 自定义序列化 fallback
+        ensure_ascii=False,  # 保留中文字符，避免转义
+        sort_keys=True,  # 按 key 排序，保证输出稳定
+        separators=(",", ":"),  # 紧凑分隔符，消除空格差异
+        default=_json_default,  # 自定义序列化 fallback
     )
 
 
@@ -61,6 +64,7 @@ class CacheTTLs:
     - 重排序: 86400 秒（24小时）
     - 用户记忆: 300 秒（5分钟），记忆提取有时效性
     """
+
     query_rewrite_ttl_s: int = 86400
     embedding_ttl_s: int = 604800
     retrieval_ttl_s: int = 3600
@@ -74,9 +78,7 @@ class CacheTTLs:
             return cls()
         default = cls()
         return cls(
-            query_rewrite_ttl_s=int(
-                value.get("query_rewrite_ttl_s", default.query_rewrite_ttl_s)
-            ),
+            query_rewrite_ttl_s=int(value.get("query_rewrite_ttl_s", default.query_rewrite_ttl_s)),
             embedding_ttl_s=int(value.get("embedding_ttl_s", default.embedding_ttl_s)),
             retrieval_ttl_s=int(value.get("retrieval_ttl_s", default.retrieval_ttl_s)),
             rerank_ttl_s=int(value.get("rerank_ttl_s", default.rerank_ttl_s)),
@@ -124,15 +126,31 @@ class RedisJsonCache(JsonCache):
     - 异常安全：get/set 操作失败不抛异常，静默降级
     """
 
-    def __init__(self, client: Any, namespace: str = DEFAULT_CACHE_NAMESPACE) -> None:
+    def __init__(
+        self, client: Any, namespace: str = DEFAULT_CACHE_NAMESPACE, health_check_interval_s: float = 60.0
+    ) -> None:
         super().__init__(namespace=namespace)
         self.client = client  # Redis 客户端实例
         self._available = True  # 标记 Redis 是否可用，异常时自动降级
+        self._health_check_interval_s = health_check_interval_s
+        self._last_health_check = 0.0  # 上次尝试重连的时间戳
+
+    def _try_reconnect(self) -> bool:
+        """定期尝试重新连接 Redis，实现 circuit breaker 自动恢复。"""
+        now = time.monotonic()
+        if now - self._last_health_check < self._health_check_interval_s:
+            return False
+        self._last_health_check = now
+        try:
+            self.client.ping()
+            self._available = True
+            return True
+        except Exception:
+            return False
 
     def get_json(self, key: str) -> Any | None:
         """从 Redis 获取并反序列化 JSON 值，失败时静默返回 None。"""
-        # 如果之前已标记不可用，直接跳过
-        if not self._available:
+        if not self._available and not self._try_reconnect():
             return None
         try:
             raw = self.client.get(key)
@@ -153,8 +171,7 @@ class RedisJsonCache(JsonCache):
 
     def set_json(self, key: str, value: Any, ttl_s: int | None = None) -> None:
         """将值序列化为 JSON 并存入 Redis，可选设置过期时间。"""
-        # 不可用时静默跳过
-        if not self._available:
+        if not self._available and not self._try_reconnect():
             return
         # TTL 为 0 或负数时忽略写入（无意义）
         if ttl_s is not None and ttl_s <= 0:
@@ -175,12 +192,18 @@ class InMemoryJsonCache(JsonCache):
 
     用于单元测试和轻量级集成场景，不依赖外部服务。
     支持 TTL 过期清理（惰性删除：仅在 get 时检查）。
+    支持 max_entries 限制，使用 LRU 策略淘汰超出的条目。
     """
 
-    def __init__(self, namespace: str = DEFAULT_CACHE_NAMESPACE) -> None:
+    def __init__(
+        self,
+        namespace: str = DEFAULT_CACHE_NAMESPACE,
+        max_entries: int = 10000,
+    ) -> None:
         super().__init__(namespace=namespace)
-        # 存储结构: key -> (序列化后的 JSON 字符串, 过期时间戳或 None)
-        self._values: dict[str, tuple[str, float | None]] = {}
+        # 使用 OrderedDict 实现 LRU：新写入/命中的 key 移到末尾，淘汰时从开头移除
+        self._values: collections.OrderedDict[str, tuple[str, float | None]] = collections.OrderedDict()
+        self.max_entries = max_entries
 
     def get_json(self, key: str) -> Any | None:
         """从内存获取缓存值，按需检查过期。"""
@@ -190,9 +213,10 @@ class InMemoryJsonCache(JsonCache):
         raw, expires_at = stored
         # 检查是否已过期（惰性删除策略）
         if expires_at is not None and expires_at <= time.time():
-            # 过期则删除条目并返回未命中
             self._values.pop(key, None)
             return None
+        # 访问命中时移到末尾（LRU 策略）
+        self._values.move_to_end(key)
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -200,11 +224,17 @@ class InMemoryJsonCache(JsonCache):
 
     def set_json(self, key: str, value: Any, ttl_s: int | None = None) -> None:
         """将值序列化后存入内存字典，可选设置 TTL。"""
-        # TTL 为 0 或负数时忽略写入
         if ttl_s is not None and ttl_s <= 0:
             return
-        # 计算过期时间：当前时间 + TTL；TTL 为 None 表示永不过期
         expires_at = time.time() + ttl_s if ttl_s is not None and ttl_s > 0 else None
+        # 如果 key 已存在，更新并移到末尾
+        if key in self._values:
+            self._values[key] = (stable_json_dumps(value), expires_at)
+            self._values.move_to_end(key)
+            return
+        # 如果超出容量限制，淘汰最旧条目（开头）
+        while len(self._values) >= self.max_entries:
+            self._values.popitem(last=False)
         self._values[key] = (stable_json_dumps(value), expires_at)
 
     def clear(self) -> None:
@@ -245,7 +275,7 @@ def create_redis_cache(
         # 从 URL 创建 Redis 客户端
         client = redis.Redis.from_url(
             redis_url,
-            decode_responses=True,           # 自动解码响应为 Python str
+            decode_responses=True,  # 自动解码响应为 Python str
             socket_timeout=socket_timeout_s,  # 读写超时
             socket_connect_timeout=socket_timeout_s,  # 连接超时
         )
@@ -255,3 +285,38 @@ def create_redis_cache(
         # 连接失败（如 Redis 未启动），返回 None，自动降级
         return None
     return RedisJsonCache(client, namespace=namespace)
+
+
+def read_cached_list(
+    cache: JsonCache | None,
+    category: str,
+    payload: dict[str, Any],
+) -> list[dict] | None:
+    """从 JSON 缓存中读取列表类型的结果。
+
+    如果缓存不可用、key 生成失败或数据类型不对则返回 None。
+    """
+    key = cache_key_or_none(cache, category, payload)
+    if key is None:
+        return None
+    cached = cache.get_json(key)
+    if not isinstance(cached, list):
+        return None
+    return [dict(item) for item in cached if isinstance(item, dict)]
+
+
+def write_cached_list(
+    cache: JsonCache | None,
+    category: str,
+    payload: dict[str, Any],
+    value: list[dict],
+    ttl_s: int,
+) -> None:
+    """将列表结果写入 JSON 缓存，设置过期时间（秒）。
+
+    如果缓存不可用或 key 生成失败则静默跳过。
+    """
+    key = cache_key_or_none(cache, category, payload)
+    if key is None:
+        return
+    cache.set_json(key, value, ttl_s=ttl_s)

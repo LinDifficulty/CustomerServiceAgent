@@ -12,18 +12,18 @@ from .llm_retry import LLMRetryPolicy, ainvoke_with_retry, invoke_with_retry
 from .model_factory import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, create_chat_model
 from .rag_service import RAGService
 from .trace_service import TraceRecorder, summarize_result
-from .utils import coerce_message_content, load_prompt, parse_json_object
+from .utils import coerce_message_content, load_prompt, parse_json_object, trace_retry_failure
 
 
 @dataclass
 class QueryRewriteResult:
     """查询改写结果，包含原始查询、改写后查询、多条检索语句和备注信息。"""
 
-    original_query: str       # 用户输入的原始查询
-    rewritten_query: str       # LLM 改写后的主查询，更规范、更适合检索
+    original_query: str  # 用户输入的原始查询
+    rewritten_query: str  # LLM 改写后的主查询，更规范、更适合检索
     search_queries: list[str]  # 多条检索语句（最多3条），用于多路融合检索
-    notes: list[str]           # 改写过程中 LLM 给出的补充说明
-    raw_response: str          # LLM 返回的原始 JSON 文本，便于调试和追踪
+    notes: list[str]  # 改写过程中 LLM 给出的补充说明
+    raw_response: str  # LLM 返回的原始 JSON 文本，便于调试和追踪
 
 
 class LLMQueryRewriter:
@@ -63,9 +63,12 @@ class LLMQueryRewriter:
         self.cache = cache
         self.cache_ttl_s = cache_ttl_s  # 缓存有效期（秒），默认 24 小时
         # 系统提示词：定义改写器的角色、约束和输出格式
-        self.system_prompt = SystemMessage(
-            content=load_prompt("query_rewrite_system.txt")
-        )
+        self.system_prompt = SystemMessage(content=load_prompt("query_rewrite_system.txt"))
+
+    def _trace_event(self, name: str, payload: dict[str, Any]) -> None:
+        """向追踪记录器发送事件（如果配置了 trace_recorder）。"""
+        if self.trace_recorder is not None:
+            self.trace_recorder.event("query_rewrite", name, payload)
 
     def rewrite(self, query: str) -> QueryRewriteResult:
         """同步改写查询。
@@ -140,12 +143,7 @@ class LLMQueryRewriter:
         """构建发送给 LLM 的消息列表（系统提示词 + 用户问题）。"""
         return [
             self.system_prompt,
-            HumanMessage(
-                content=(
-                    "请改写下面这条用户问题，用于商品知识库检索。\n"
-                    f"用户问题：{query}"
-                )
-            ),
+            HumanMessage(content=(f"请改写下面这条用户问题，用于商品知识库检索。\n用户问题：{query}")),
         ]
 
     def _build_result(
@@ -181,22 +179,19 @@ class LLMQueryRewriter:
             notes=notes,
             raw_response=raw_response,
         )
-        # 如果有追踪记录器，记录改写事件
-        if self.trace_recorder is not None:
-            self.trace_recorder.event(
-                "query_rewrite",
-                "query_rewrite.rewrite",
-                {
-                    "model_name": self.model_name,
-                    "provider": self.provider,
-                    "original_query": query,
-                    "rewritten_query": rewritten_query,
-                    "search_queries": search_queries[:3],
-                    "notes": notes,
-                    "cache_hit": False,
-                    "elapsed_ms": elapsed_ms,
-                },
-            )
+        self._trace_event(
+            "query_rewrite.rewrite",
+            {
+                "model_name": self.model_name,
+                "provider": self.provider,
+                "original_query": query,
+                "rewritten_query": rewritten_query,
+                "search_queries": search_queries[:3],
+                "notes": notes,
+                "cache_hit": False,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
         return result
 
     def _cache_key(self, query: str) -> str | None:
@@ -249,29 +244,22 @@ class LLMQueryRewriter:
             original_query=query,
             rewritten_query=str(payload.get("rewritten_query") or query),
             search_queries=normalized_queries,
-            notes=(
-                [str(item) for item in notes if str(item)]
-                if isinstance(notes, list)
-                else []
-            ),
+            notes=([str(item) for item in notes if str(item)] if isinstance(notes, list) else []),
             raw_response=str(payload.get("raw_response") or ""),
         )
-        # 记录缓存命中追踪事件
-        if self.trace_recorder is not None:
-            self.trace_recorder.event(
-                "query_rewrite",
-                "query_rewrite.rewrite",
-                {
-                    "model_name": self.model_name,
-                    "provider": self.provider,
-                    "original_query": query,
-                    "rewritten_query": result.rewritten_query,
-                    "search_queries": result.search_queries,
-                    "notes": result.notes,
-                    "cache_hit": True,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                },
-            )
+        self._trace_event(
+            "query_rewrite.rewrite",
+            {
+                "model_name": self.model_name,
+                "provider": self.provider,
+                "original_query": query,
+                "rewritten_query": result.rewritten_query,
+                "search_queries": result.search_queries,
+                "notes": result.notes,
+                "cache_hit": True,
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+            },
+        )
         return result
 
     def _write_cached_result(self, result: QueryRewriteResult) -> None:
@@ -291,17 +279,14 @@ class LLMQueryRewriter:
         )
 
     def _trace_retry_failure(self, event: dict[str, Any]) -> None:
-        """记录 LLM 调用重试失败的事件。
-
-        level 根据是否会继续重试来区分：会重试用 warning，不会重试用 error。
-        """
-        if self.trace_recorder is None:
-            return
-        self.trace_recorder.event(
+        """记录 LLM 调用重试失败的事件。"""
+        trace_retry_failure(
+            self.trace_recorder,
             "model",
             "query_rewrite.model_retry",
-            {"provider": self.provider, "model_name": self.model_name, **event},
-            level="warning" if event.get("will_retry") else "error",
+            self.provider,
+            self.model_name,
+            event,
         )
 
     def _normalize_queries(self, value: Any, original_query: str) -> list[str]:
@@ -340,17 +325,132 @@ def _merge_search_result(
     key = (item["source"], chunk_index)
     existing = candidate_map.get(key)
     item_score = float(item.get("hybrid_score", item.get("score", 0.0)))
-    existing_score = (
-        float(existing.get("hybrid_score", existing.get("score", 0.0)))
-        if existing is not None
-        else 0.0
-    )
+    existing_score = float(existing.get("hybrid_score", existing.get("score", 0.0))) if existing is not None else 0.0
     if existing is None or item_score > existing_score:
         merged = dict(item)
         merged["matched_queries"] = [retrieval_query]
         candidate_map[key] = merged
     elif retrieval_query not in existing["matched_queries"]:
         existing["matched_queries"].append(retrieval_query)
+
+
+async def _multi_query_search_impl(
+    rag: RAGService,
+    original_query: str,
+    rewritten_queries: list[str],
+    *,
+    top_k: int,
+    candidate_top_k: int,
+    vector_weight: float,
+    bm25_weight: float,
+    use_bm25: bool | None,
+    use_rerank: bool | None,
+    trace_recorder: TraceRecorder | None,
+    use_async: bool,
+) -> list[dict]:
+    """Shared implementation for multi-query rewrite search (sync and async)."""
+    start = time.perf_counter()
+    candidate_map: dict[tuple[str, int], dict] = {}
+
+    if use_async:
+
+        async def _search_one_async(retrieval_query: str) -> tuple[str, list[dict]]:
+            if hasattr(rag, "asearch_by_hybrid"):
+                results = await rag.asearch_by_hybrid(
+                    query=retrieval_query,
+                    top_k=candidate_top_k,
+                    vector_weight=vector_weight,
+                    bm25_weight=bm25_weight,
+                    use_bm25=use_bm25,
+                )
+            elif hasattr(rag, "search_by_hybrid"):
+                results = await asyncio.to_thread(
+                    rag.search_by_hybrid,
+                    query=retrieval_query,
+                    top_k=candidate_top_k,
+                    vector_weight=vector_weight,
+                    bm25_weight=bm25_weight,
+                    use_bm25=use_bm25,
+                )
+            else:
+                results = await asyncio.to_thread(
+                    rag.search,
+                    query=retrieval_query,
+                    top_k=top_k,
+                    use_bm25=use_bm25,
+                    use_rerank=False,
+                    candidate_top_k=candidate_top_k,
+                )
+            return retrieval_query, results
+
+        query_results = await asyncio.gather(*(_search_one_async(q) for q in rewritten_queries))
+        for retrieval_query, results in query_results:
+            for item in results:
+                _merge_search_result(item, retrieval_query, candidate_map)
+    else:
+        for retrieval_query in rewritten_queries:
+            results = rag.search_by_hybrid(
+                query=retrieval_query,
+                top_k=candidate_top_k,
+                vector_weight=vector_weight,
+                bm25_weight=bm25_weight,
+                use_bm25=use_bm25,
+            )
+            for item in results:
+                _merge_search_result(item, retrieval_query, candidate_map)
+
+    # Empty result trace and early return
+    if not candidate_map:
+        if trace_recorder is not None:
+            trace_recorder.event(
+                "retrieval",
+                "query_rewrite.multi_query_search",
+                {
+                    "original_query": original_query,
+                    "rewritten_queries": rewritten_queries,
+                    "candidate_count": 0,
+                    "result_count": 0,
+                    "elapsed_ms": (time.perf_counter() - start) * 1000,
+                },
+            )
+        return []
+
+    # Sort and deduplicate candidates
+    merged_candidates = sorted(
+        candidate_map.values(),
+        key=lambda item: float(item.get("hybrid_score", item.get("score", 0.0))),
+        reverse=True,
+    )[:candidate_top_k]
+
+    # Rerank or truncate
+    actual_use_rerank = getattr(rag, "default_use_rerank", False) if use_rerank is None else use_rerank
+    if not actual_use_rerank:
+        results = merged_candidates[:top_k]
+    elif use_async and hasattr(rag, "arerank"):
+        results = await rag.arerank(original_query, merged_candidates, top_k=top_k)
+    elif use_async:
+        results = await asyncio.to_thread(rag.rerank, original_query, merged_candidates, top_k=top_k)
+    else:
+        results = rag.rerank(original_query, merged_candidates, top_k=top_k)
+
+    # Trace event
+    if trace_recorder is not None:
+        trace_recorder.event(
+            "retrieval",
+            "query_rewrite.multi_query_search",
+            {
+                "original_query": original_query,
+                "rewritten_queries": rewritten_queries,
+                "candidate_count": len(candidate_map),
+                "top_k": top_k,
+                "candidate_top_k": candidate_top_k,
+                "use_rerank": actual_use_rerank,
+                "result_count": len(results),
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+                "results": [summarize_result(item, include_content=True) for item in results],
+            },
+        )
+    return results
 
 
 def search_with_query_rewrites(
@@ -366,76 +466,22 @@ def search_with_query_rewrites(
     use_rerank: bool | None = None,
     trace_recorder: TraceRecorder | None = None,
 ) -> list[dict]:
-    """多条改写查询合并检索：分别检索，合并去重候选项，再用原查询重排序。
-
-    典型用法：LLM 将用户问题改写成 1~3 条检索语句，对每条分别检索，
-    按最高得分去重合并，最后用原始用户问题对合并后的候选项进行 CrossEncoder 重排序。
-    """
-    start = time.perf_counter()
-    # candidate_map: key=(source, chunk_index) 用于跨查询去重，只保留最高得分版本
-    candidate_map: dict[tuple[str, int], dict] = {}
-
-    # 对每条改写查询分别进行混合检索
-    for retrieval_query in rewritten_queries:
-        results = rag.search_by_hybrid(
-            query=retrieval_query,
-            top_k=candidate_top_k,
+    """多条改写查询合并检索：分别检索，合并去重候选项，再用原查询重排序。"""
+    return asyncio.run(
+        _multi_query_search_impl(
+            rag,
+            original_query,
+            rewritten_queries,
+            top_k=top_k,
+            candidate_top_k=candidate_top_k,
             vector_weight=vector_weight,
             bm25_weight=bm25_weight,
             use_bm25=use_bm25,
+            use_rerank=use_rerank,
+            trace_recorder=trace_recorder,
+            use_async=False,
         )
-        for item in results:
-            _merge_search_result(item, retrieval_query, candidate_map)
-
-    # 如果没有找到任何候选，记录追踪并返回空列表
-    if not candidate_map:
-        if trace_recorder is not None:
-            trace_recorder.event(
-                "retrieval",
-                "query_rewrite.multi_query_search",
-                {
-                    "original_query": original_query,
-                    "rewritten_queries": rewritten_queries,
-                    "candidate_count": 0,
-                    "result_count": 0,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                },
-            )
-        return []
-
-    # 按 hybrid_score 降序排列候选，取 top candidate_top_k 用于重排序
-    merged_candidates = sorted(
-        candidate_map.values(),
-        key=lambda item: float(item.get("hybrid_score", item.get("score", 0.0))),
-        reverse=True,
-    )[:candidate_top_k]
-    # 决定是否启用 CrossEncoder 重排序
-    actual_use_rerank = rag.default_use_rerank if use_rerank is None else use_rerank
-    if not actual_use_rerank:
-        results = merged_candidates[:top_k]  # 不重排序，直接截断取 top_k
-    else:
-        # 用原始用户问题对合并后的候选进行重排序
-        results = rag.rerank(original_query, merged_candidates, top_k=top_k)
-    # 记录多查询检索追踪事件
-    if trace_recorder is not None:
-        trace_recorder.event(
-            "retrieval",
-            "query_rewrite.multi_query_search",
-            {
-                "original_query": original_query,
-                "rewritten_queries": rewritten_queries,
-                "candidate_count": len(candidate_map),
-                "top_k": top_k,
-                "candidate_top_k": candidate_top_k,
-                "use_rerank": actual_use_rerank,
-                "result_count": len(results),
-                "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
-            },
-        )
-    return results
+    )
 
 
 async def asearch_with_query_rewrites(
@@ -451,112 +497,17 @@ async def asearch_with_query_rewrites(
     use_rerank: bool | None = None,
     trace_recorder: TraceRecorder | None = None,
 ) -> list[dict]:
-    """多条改写查询的异步合并检索。
-
-    与同步版本逻辑相同，但多条改写查询的检索并发执行（使用 asyncio.gather），
-    有效减少总延迟。也支持异步 CrossEncoder 重排序。
-    """
-    start = time.perf_counter()
-    candidate_map: dict[tuple[str, int], dict] = {}
-
-    # 定义单条查询的异步检索函数，兼容不同检索接口
-    async def search_one(retrieval_query: str) -> tuple[str, list[dict]]:
-        if hasattr(rag, "asearch_by_hybrid"):
-            # RAG 服务支持原生异步混合检索
-            results = await rag.asearch_by_hybrid(
-                query=retrieval_query,
-                top_k=candidate_top_k,
-                vector_weight=vector_weight,
-                bm25_weight=bm25_weight,
-                use_bm25=use_bm25,
-            )
-        elif hasattr(rag, "search_by_hybrid"):
-            # 检索方法支持混合检索但不支持异步，放到线程池中执行
-            results = await asyncio.to_thread(
-                rag.search_by_hybrid,
-                query=retrieval_query,
-                top_k=candidate_top_k,
-                vector_weight=vector_weight,
-                bm25_weight=bm25_weight,
-                use_bm25=use_bm25,
-            )
-        else:
-            # 最后回退：使用基础检索方法
-            results = await asyncio.to_thread(
-                rag.search,
-                query=retrieval_query,
-                top_k=top_k,
-                use_bm25=use_bm25,
-                use_rerank=False,
-                candidate_top_k=candidate_top_k,
-            )
-        return retrieval_query, results
-
-    # 并发执行所有改写查询的检索，显著减少总耗时
-    query_results = await asyncio.gather(
-        *(search_one(retrieval_query) for retrieval_query in rewritten_queries)
+    """多条改写查询的异步合并检索（并发执行各改写查询，减少总延迟）。"""
+    return await _multi_query_search_impl(
+        rag,
+        original_query,
+        rewritten_queries,
+        top_k=top_k,
+        candidate_top_k=candidate_top_k,
+        vector_weight=vector_weight,
+        bm25_weight=bm25_weight,
+        use_bm25=use_bm25,
+        use_rerank=use_rerank,
+        trace_recorder=trace_recorder,
+        use_async=True,
     )
-    # 合并所有检索结果到候选集
-    for retrieval_query, results in query_results:
-        for item in results:
-            _merge_search_result(item, retrieval_query, candidate_map)
-
-    # 无候选时的处理
-    if not candidate_map:
-        if trace_recorder is not None:
-            trace_recorder.event(
-                "retrieval",
-                "query_rewrite.multi_query_search",
-                {
-                    "original_query": original_query,
-                    "rewritten_queries": rewritten_queries,
-                    "candidate_count": 0,
-                    "result_count": 0,
-                    "elapsed_ms": (time.perf_counter() - start) * 1000,
-                },
-            )
-        return []
-
-    # 合并候选并按得分降序排列
-    merged_candidates = sorted(
-        candidate_map.values(),
-        key=lambda item: float(item.get("hybrid_score", item.get("score", 0.0))),
-        reverse=True,
-    )[:candidate_top_k]
-    # 决定是否重排序，优先使用异步 rerank
-    actual_use_rerank = (
-        getattr(rag, "default_use_rerank", False) if use_rerank is None else use_rerank
-    )
-    if not actual_use_rerank:
-        results = merged_candidates[:top_k]
-    elif hasattr(rag, "arerank"):
-        # RAG 服务支持异步重排序
-        results = await rag.arerank(original_query, merged_candidates, top_k=top_k)
-    else:
-        # 回退到线程池中执行同步重排序
-        results = await asyncio.to_thread(
-            rag.rerank,
-            original_query,
-            merged_candidates,
-            top_k=top_k,
-        )
-    # 记录追踪事件
-    if trace_recorder is not None:
-        trace_recorder.event(
-            "retrieval",
-            "query_rewrite.multi_query_search",
-            {
-                "original_query": original_query,
-                "rewritten_queries": rewritten_queries,
-                "candidate_count": len(candidate_map),
-                "top_k": top_k,
-                "candidate_top_k": candidate_top_k,
-                "use_rerank": actual_use_rerank,
-                "result_count": len(results),
-                "elapsed_ms": (time.perf_counter() - start) * 1000,
-                "results": [
-                    summarize_result(item, include_content=True) for item in results
-                ],
-            },
-        )
-    return results
